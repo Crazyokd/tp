@@ -1,0 +1,33 @@
+{
+  "name": "tp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "packages/adapters/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @tp/web",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "oxlint .",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "build": "npm run typecheck && npm run build -w @tp/web",
+    "start": "TP_ADAPTER_MODULES=@tp/adapter-browser npm run start -w @tp/server",
+    "server": "TP_ADAPTER_MODULES=@tp/adapter-browser npm run start -w @tp/server",
+    "mcp": "npm run mcp -w @tp/mcp",
+    "test": "npm run test --workspaces --if-present && npm run test:root",
+    "test:root": "node --import tsx --test --test-concurrency=8 test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "oxlint": "^1.82.0",
+    "prettier": "^3.9.6",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}

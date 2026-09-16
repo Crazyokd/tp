@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "tp": {
+      "command": "npm",
+      "args": [
+        "run",
+        "mcp"
+      ]
+    }
+  }
+}

@@ -1,0 +1,13 @@
+node_modules/
+data/
+dist/
+.codegraph/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
+!.cursor/mcp.json
+.superpowers/
+docs/superpowers/plans/
+docs/archify/*.html
+docs/archify/*.png
+docs/archify/*.visual-check.*

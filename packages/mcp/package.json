@@ -1,0 +1,19 @@
+{
+  "name": "@tp/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "mcp": "node --import tsx src/index.ts",
+    "generate-clients": "node --import tsx src/generate-clients.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@tp/contract": "0.1.0"
+  }
+}

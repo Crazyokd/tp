@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Browser Adapter Demo</title>
+  </head>
+  <body>
+    <input id="name" data-testid="name" />
+    <button id="go" type="button" data-testid="go">Go</button>
+    <p id="out" data-testid="out">idle</p>
+    <script>
+      document.getElementById('go').addEventListener('click', () => {
+        const value = document.getElementById('name').value;
+        document.getElementById('out').textContent = 'hello ' + value;
+      });
+    </script>
+  </body>
+</html>

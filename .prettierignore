@@ -1,0 +1,13 @@
+node_modules
+data
+dist
+.codegraph
+.cursor
+.mcp.json
+.superpowers
+docs/archify
+package-lock.json
+packages/contract/openapi.json
+packages/web/public/architecture-atlas
+packages/web/public/archify
+*.png
