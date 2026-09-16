@@ -10,13 +10,59 @@ Generic test platform. The server exposes adapter capabilities, workers execute 
 
 ## Run
 
-Requires Node 22+, npm, and Linux `flock`. Browser runs require Chromium:
+Requires Node 22+ and npm. Browser runs require Chromium:
 
 ```bash
 npm install
 npx playwright install chromium
 npm run server          # :3000, loads Browser adapter
 npm run dev             # :5173, proxies /api to :3000
+```
+
+In another shell, create and run a Browser smoke case:
+
+```bash
+CASE_ID=$(
+  curl -sS -X POST http://127.0.0.1:3000/api/cases \
+    -H 'content-type: application/json' \
+    --data '{
+      "name": "Browser smoke",
+      "definition": {
+        "main": "Main",
+        "trees": {
+          "Main": {
+            "type": "Sequence",
+            "children": [
+              {
+                "type": "Action",
+                "adapter": "browser",
+                "actor": "browser",
+                "capability": "browser.goto",
+                "ports": {
+                  "url": { "literal": "http://127.0.0.1:5173/" }
+                }
+              },
+              {
+                "type": "Condition",
+                "adapter": "browser",
+                "actor": "browser",
+                "capability": "browser.expect_text",
+                "ports": {
+                  "selector": { "literal": "body" },
+                  "text": { "literal": "TP Test Platform" }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }' \
+    | node -pe 'JSON.parse(require("node:fs").readFileSync(0, "utf8")).id'
+)
+
+curl -sS -X POST http://127.0.0.1:3000/api/runs \
+  -H 'content-type: application/json' \
+  --data "{\"caseId\":\"$CASE_ID\"}"
 ```
 
 Production-style local run:
@@ -49,6 +95,14 @@ npm test
 | Adapter   | `TP_ADAPTER_MODULES`    | startup-only registration |
 
 Contracts: `/swagger`, `/openapi.json`. Lists use `{ items, total }` with paired `limit` / `offset`. Errors use `{ code, message }`.
+
+## MCP
+
+The project includes Codex, Cursor, and generic MCP launch configs that run `npm run mcp`. Start `npm run server` first. For a non-default server URL, set `TP_BASE_URL`, for example:
+
+```bash
+TP_BASE_URL=http://127.0.0.1:3000 npm run mcp
+```
 
 ## Architecture
 
