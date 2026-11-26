@@ -4,29 +4,43 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import {
   cancelRun,
   createCase,
-  createRun,
+  createGroup,
+  updateGroup,
+  deleteGroup,
+  listGroups,
+  createBatch,
+  cancelBatch,
   deleteCase,
   listAdapters,
   listCases,
+  listBatches,
+  getBatch,
   listRuns,
   listWorkers,
+  runEventsPath,
   updateCase,
+  type HttpAdapter,
 } from './api/client.ts';
+import { BatchCreateDialog } from './features/BatchCreateDialog.tsx';
 import { BuilderPage } from './features/BuilderPage.tsx';
+import { GroupsPage } from './features/GroupsPage.tsx';
 import { CasesPage } from './features/CasesPage.tsx';
 import { RunsPage } from './features/RunsPage.tsx';
 import { WorkersPage } from './features/WorkersPage.tsx';
 import type { CatalogCapability } from '@tp/contract';
 import {
+  httpRunSchema,
   requireCaseDefinition,
   type CaseDefinition,
+  type Batch,
   type LeafNode,
   type PortBinding,
   type Run,
   type TestCase,
+  type TestGroup,
   type WorkerSlot,
 } from '@tp/contract';
-import { appViewHash, parseAppView, type AppView } from './domain/app-view.ts';
+import { appViewHash, parseAppLocation, type AppView } from './domain/app-view.ts';
 import {
   defaultDefinition,
   deleteNode,
@@ -35,6 +49,7 @@ import {
   LEAF_TYPES,
   moveNode,
   replaceNodeType,
+  syncCaseSessions,
   updateLeaf,
   updateWrapper,
   type DropMode,
@@ -43,7 +58,9 @@ import {
 import {
   advanceSelectedRunSnapshot,
   defaultExpandedRunId,
+  mergeIncomingRuns,
   mergeRuns,
+  preferNewerRun,
   visibleRunsWithSelectedSnapshot,
   type SelectedRunCache,
   type UnifiedRun,
@@ -52,28 +69,50 @@ import {
 const VIEWS: { id: AppView; label: string }[] = [
   { id: 'runs', label: 'Runs' },
   { id: 'cases', label: 'Cases' },
+  { id: 'groups', label: 'Groups' },
   { id: 'builder', label: 'Builder' },
   { id: 'workers', label: 'Workers' },
 ];
 
+const BATCH_PAGE_SIZE = 20;
+
 export function App() {
-  const [view, setViewState] = useState<AppView>(() => parseAppView(window.location.hash));
+  const [view, setViewState] = useState<AppView>(() => parseAppLocation(window.location.hash).view);
+  const [focusBatchId, setFocusBatchId] = useState<string | null>(() => parseAppLocation(window.location.hash).batchId);
+  const [groups, setGroups] = useState<TestGroup[]>([]);
   const [cases, setCases] = useState<TestCase[]>([]);
+  const [batches, setBatches] = useState<Batch[]>([]);
+  const [batchOffset, setBatchOffset] = useState(0);
+  const [batchTotal, setBatchTotal] = useState(0);
+  const [pageLoading, setPageLoading] = useState(false);
+  const batchOffsetRef = useRef(0);
+  const focusBatchIdRef = useRef(focusBatchId);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [workerRuns, setWorkerRuns] = useState<Run[]>([]);
   const [workers, setWorkers] = useState<WorkerSlot[]>([]);
+  const [adapters, setAdapters] = useState<HttpAdapter[]>([]);
   const [capabilities, setCapabilities] = useState<CatalogCapability[]>([]);
   const [draft, setDraft] = useState<CaseDefinition>(defaultDefinition);
   const [selectedPath, setSelectedPath] = useState('');
   const [caseId, setCaseId] = useState('');
   const [caseName, setCaseName] = useState('Browser smoke');
+  const [caseDescription, setCaseDescription] = useState('');
+  const [batchSelection, setBatchSelection] = useState<{
+    selector: { caseIds: string[] } | { groupId: string };
+    label: string;
+  } | null>(null);
   const [status, setStatus] = useState('');
   const [connectionWarning, setConnectionWarning] = useState('');
+  const [catalogWarning, setCatalogWarning] = useState('');
   const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
   const [selectedRunCache, setSelectedRunCache] = useState<SelectedRunCache | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const refreshInFlight = useRef<Promise<void> | null>(null);
+  const catalogRefreshInFlight = useRef<Promise<void> | null>(null);
+  const catalogsLoaded = useRef(false);
   const expandedRunIdRef = useRef<string | null>(null);
   const selectedRunCacheRef = useRef<SelectedRunCache | null>(null);
+  const runsRef = useRef<Run[]>([]);
 
   const selected = useMemo(() => getNode(draft, selectedPath), [draft, selectedPath]);
   const definitionText = useMemo(() => JSON.stringify(draft, null, 2), [draft]);
@@ -85,6 +124,8 @@ export function App() {
 
   const setView = useCallback((next: AppView) => {
     setViewState(next);
+    setFocusBatchId(null);
+    focusBatchIdRef.current = null;
     const hash = appViewHash(next);
     if (window.location.hash !== hash) window.location.hash = hash;
   }, []);
@@ -96,56 +137,167 @@ export function App() {
     setSelectedRunCache(cache);
   }, []);
 
-  const refresh = useCallback((): Promise<void> => {
-    if (refreshInFlight.current) return refreshInFlight.current;
+  const applyWatchedRun = useCallback(
+    (incoming: Run) => {
+      const selected = selectedRunCacheRef.current?.snapshot.run;
+      const run = preferNewerRun(selected?.id === incoming.id ? selected : undefined, incoming);
+      setRuns((current) => {
+        const next = current.some((item) => item.id === run.id)
+          ? current.map((item) => (item.id === run.id ? preferNewerRun(item, run) : item))
+          : [...current, run];
+        runsRef.current = next;
+        return next;
+      });
+      if (expandedRunIdRef.current !== run.id) return;
+      applyRunSelection(run.id, {
+        snapshot: {
+          kind:
+            run.status === 'queued' || run.status === 'running' || run.status === 'canceling' ? 'active' : 'finished',
+          run,
+        },
+        missingSuccessfulPolls: 0,
+      });
+    },
+    [applyRunSelection],
+  );
+
+  const refreshCatalogs = useCallback((includeAdapters = !catalogsLoaded.current): Promise<void> => {
+    if (catalogRefreshInFlight.current) {
+      return catalogRefreshInFlight.current.then(() => refreshCatalogs(includeAdapters));
+    }
     const request = (async () => {
       try {
-        const [nextCases, nextRunPage, nextAdapters, nextWorkers] = await Promise.all([
+        const [nextCases, nextGroups, nextAdapters] = await Promise.all([
           listCases(),
-          listRuns(),
-          listAdapters(),
-          listWorkers(),
+          listGroups(),
+          includeAdapters ? listAdapters() : null,
         ]);
-        const nextCapabilities = nextAdapters.items.flatMap((adapter) => adapter.capabilities);
-        const nextRuns = mergeRuns(nextRunPage.items);
-        const currentId = expandedRunIdRef.current;
-        if (currentId === null) {
-          const nextId = defaultExpandedRunId(currentId, nextRuns);
-          applyRunSelection(nextId, nextId === null ? null : advanceSelectedRunSnapshot(nextRuns, nextId, null).cache);
-        } else {
-          const selection = advanceSelectedRunSnapshot(nextRuns, currentId, selectedRunCacheRef.current);
-          if (selection.expired) {
-            const nextId = defaultExpandedRunId(null, nextRuns);
+        const parsedCases = nextCases.items.map((item) => ({
+          ...item,
+          definition: requireCaseDefinition(item.definition),
+        }));
+        setCases(parsedCases);
+        setGroups(nextGroups.items);
+        if (nextAdapters) {
+          setAdapters(nextAdapters.items);
+          setCapabilities(nextAdapters.items.flatMap((adapter) => adapter.capabilities));
+        }
+        catalogsLoaded.current = true;
+        setCatalogWarning('');
+      } catch (error) {
+        setCatalogWarning(`目录加载失败，继续显示上次数据：${errorMessage(error)}`);
+      } finally {
+        catalogRefreshInFlight.current = null;
+      }
+    })();
+    catalogRefreshInFlight.current = request;
+    return request;
+  }, []);
+
+  const refresh = useCallback(
+    (query?: { offset: number; focusBatchId: string | null }): Promise<void> => {
+      if (refreshInFlight.current) {
+        return query ? refreshInFlight.current.then(() => refresh(query)) : refreshInFlight.current;
+      }
+      let offset = query?.offset ?? batchOffsetRef.current;
+      const focusId = query ? query.focusBatchId : focusBatchIdRef.current;
+      const request = (async () => {
+        try {
+          const [nextBatchPage, nextWorkers] = await Promise.all([
+            listBatches({ limit: BATCH_PAGE_SIZE, offset }),
+            listWorkers(),
+          ]);
+          if (offset > 0 && nextBatchPage.items.length === 0) {
+            offset = Math.max(0, Math.ceil(nextBatchPage.total / BATCH_PAGE_SIZE) - 1) * BATCH_PAGE_SIZE;
+            Object.assign(nextBatchPage, await listBatches({ limit: BATCH_PAGE_SIZE, offset }));
+          }
+          let focusWarning = '';
+          if (focusId && !nextBatchPage.items.some((batch) => batch.id === focusId)) {
+            try {
+              nextBatchPage.items.push(await getBatch(focusId));
+            } catch (error) {
+              focusWarning = `批次 ${focusId} 加载失败：${errorMessage(error)}`;
+            }
+          }
+          const pageRuns = nextBatchPage.items.flatMap((batch) => batch.runs);
+          const offPageWorkers = nextWorkers.items.some(
+            (worker) => worker.runId && !pageRuns.some((run) => run.id === worker.runId),
+          );
+          const activeRuns = offPageWorkers
+            ? (await listRuns({ status: ['running', 'canceling'], limit: nextWorkers.items.length, offset: 0 })).items
+            : [];
+          if (focusId !== focusBatchIdRef.current) return;
+          const pageChanged = offset !== batchOffsetRef.current;
+          const mergedItems = mergeIncomingRuns(runsRef.current, pageRuns);
+          const nextRuns = mergeRuns(mergedItems);
+          if (pageChanged && !nextRuns.some((item) => item.run.id === expandedRunIdRef.current)) {
+            applyRunSelection(null, null);
+          }
+          const currentId = expandedRunIdRef.current;
+          if (currentId === null) {
+            const nextId = defaultExpandedRunId(currentId, nextRuns);
             applyRunSelection(
               nextId,
               nextId === null ? null : advanceSelectedRunSnapshot(nextRuns, nextId, null).cache,
             );
           } else {
-            applyRunSelection(currentId, selection.cache);
+            const selection = advanceSelectedRunSnapshot(nextRuns, currentId, selectedRunCacheRef.current);
+            if (selection.expired) {
+              const nextId = defaultExpandedRunId(null, nextRuns);
+              applyRunSelection(
+                nextId,
+                nextId === null ? null : advanceSelectedRunSnapshot(nextRuns, nextId, null).cache,
+              );
+            } else {
+              applyRunSelection(currentId, selection.cache);
+            }
           }
+          runsRef.current = mergedItems;
+          setRuns(mergedItems);
+          setBatches((current) => {
+            const cached = selectedRunCacheRef.current?.snapshot.run;
+            const previous = cached && current.find((batch) => batch.id === cached.batchId);
+            return !pageChanged && previous && !nextBatchPage.items.some((batch) => batch.id === previous.id)
+              ? [...nextBatchPage.items, previous]
+              : nextBatchPage.items;
+          });
+          batchOffsetRef.current = offset;
+          setBatchOffset(offset);
+          setBatchTotal(nextBatchPage.total);
+          setWorkerRuns([...pageRuns, ...activeRuns]);
+          setWorkers(nextWorkers.items);
+          setConnectionWarning(focusWarning);
+        } catch (error) {
+          setConnectionWarning(`连接异常，继续显示上次数据：${errorMessage(error)}`);
+        } finally {
+          refreshInFlight.current = null;
         }
-        setCases(nextCases.items.map((item) => ({ ...item, definition: requireCaseDefinition(item.definition) })));
-        setRuns(nextRunPage.items);
-        setWorkers(nextWorkers.items);
-        setCapabilities(nextCapabilities);
-        setConnectionWarning('');
-      } catch (error) {
-        setConnectionWarning(`连接异常，继续显示上次数据：${errorMessage(error)}`);
-      } finally {
-        refreshInFlight.current = null;
-      }
-    })();
-    refreshInFlight.current = request;
-    return request;
-  }, [applyRunSelection]);
+      })();
+      refreshInFlight.current = request;
+      return request;
+    },
+    [applyRunSelection],
+  );
+
+  useEffect(() => {
+    if (!catalogsLoaded.current || view === 'cases' || view === 'groups' || view === 'builder') {
+      void refreshCatalogs(!catalogsLoaded.current);
+    }
+  }, [refreshCatalogs, view]);
 
   useEffect(() => {
     function onHashChange() {
-      setViewState(parseAppView(window.location.hash));
+      const location = parseAppLocation(window.location.hash);
+      setViewState(location.view);
+      setFocusBatchId(location.batchId);
+      if (focusBatchIdRef.current !== location.batchId) {
+        focusBatchIdRef.current = location.batchId;
+        void refresh({ offset: 0, focusBatchId: location.batchId });
+      }
     }
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
-  }, []);
+  }, [refresh]);
 
   useEffect(() => {
     let canceled = false;
@@ -166,41 +318,66 @@ export function App() {
     return () => clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    if (!expandedRunId) return;
+    const source = new EventSource(runEventsPath(expandedRunId));
+    const terminal = new Set(['passed', 'failed', 'canceled']);
+    function onRun(event: MessageEvent<string>) {
+      try {
+        const run = httpRunSchema.parse(JSON.parse(event.data));
+        applyWatchedRun(run);
+        if (terminal.has(run.status)) source.close();
+      } catch (error) {
+        setConnectionWarning(`连接异常，继续显示上次数据：${errorMessage(error)}`);
+      }
+    }
+    source.addEventListener('run', onRun);
+    return () => {
+      source.removeEventListener('run', onRun);
+      source.close();
+    };
+  }, [applyWatchedRun, expandedRunId]);
+
   async function saveCase(event?: FormEvent) {
     event?.preventDefault();
     try {
-      const saved = caseId
-        ? await updateCase(caseId, { name: caseName, definition: draft })
-        : await createCase({ name: caseName, definition: draft });
+      const body = { name: caseName, description: caseDescription, definition: draft };
+      const saved = caseId ? await updateCase(caseId, body) : await createCase(body);
       setCaseId(saved.id);
       setStatus('已保存');
-      await refresh();
+      await refreshCatalogs();
     } catch (error) {
       setStatus(errorMessage(error));
     }
   }
 
-  async function startSelectedRun() {
+  async function enqueueRuns(
+    body: ({ caseIds: string[] } | { groupId: string }) & { name?: string; description: string },
+  ) {
+    const batch = await createBatch({ ...body, trigger: { kind: 'web' } });
+    setBatches((current) => [batch, ...current.filter((item) => item.id !== batch.id)]);
+    const run = batch.runs[0];
+    if (!run) return;
+    applyRunSelection(run.id, {
+      snapshot: { kind: 'active', run },
+      missingSuccessfulPolls: 0,
+    });
+    setStatus('批次已进入执行队列');
+    await refresh({ offset: 0, focusBatchId: focusBatchIdRef.current });
+  }
+
+  function startSelectedRun() {
     if (!caseId) {
       setStatus('请先保存 Case');
       return;
     }
-    try {
-      const run = await createRun({ caseId });
-      applyRunSelection(run.id, {
-        snapshot: { kind: 'active', run },
-        missingSuccessfulPolls: 0,
-      });
-      setStatus('run 已进入执行队列');
-      await refresh();
-    } catch (error) {
-      setStatus(errorMessage(error));
-    }
+    startBatch([caseId]);
   }
 
   function resetCase() {
     setCaseId('');
     setCaseName('');
+    setCaseDescription('');
     setDraft(defaultDefinition());
     setSelectedPath('');
     setStatus('');
@@ -210,42 +387,51 @@ export function App() {
   function editCase(item: TestCase) {
     setCaseId(item.id);
     setCaseName(item.name);
+    setCaseDescription(item.description);
     setDraft(requireCaseDefinition(item.definition));
     setSelectedPath('');
     setStatus('');
     setView('builder');
   }
 
-  async function startRun(item: TestCase) {
+  function startBatch(caseIds: string[]) {
+    setBatchSelection({
+      selector: { caseIds },
+      label: `Cases：${caseIds.map((id) => cases.find((item) => item.id === id)?.name ?? id).join('、')}`,
+    });
+  }
+
+  function startGroup(groupId: string) {
+    setBatchSelection({
+      selector: { groupId },
+      label: `Group：${groups.find((group) => group.id === groupId)?.name ?? groupId}`,
+    });
+  }
+
+  async function removeCase(item: TestCase) {
     try {
-      const run = await createRun({ caseId: item.id });
-      applyRunSelection(run.id, {
-        snapshot: { kind: 'active', run },
-        missingSuccessfulPolls: 0,
-      });
-      setStatus('run 已进入执行队列');
-      await refresh();
+      await deleteCase(item.id);
+      if (caseId === item.id) {
+        setCaseId('');
+        setCaseName('');
+        setDraft(defaultDefinition());
+        setSelectedPath('');
+        setStatus('');
+      }
+      await refreshCatalogs();
     } catch (error) {
       setStatus(errorMessage(error));
     }
   }
 
-  async function removeCase(item: TestCase) {
-    await deleteCase(item.id);
-    if (caseId === item.id) {
-      setCaseId('');
-      setCaseName('');
-      setDraft(defaultDefinition());
-      setSelectedPath('');
-      setStatus('');
-    }
-    await refresh();
-  }
-
   const applyEdit = useCallback((result: { definition: CaseDefinition; selectedPath: string }) => {
-    setDraft(result.definition);
+    setDraft(syncCaseSessions(result.definition));
     setSelectedPath(result.selectedPath);
   }, []);
+
+  function applySessions(sessions: CaseDefinition['sessions']) {
+    setDraft({ ...draft, sessions });
+  }
 
   const addNode = useCallback(
     (input: NodeInput, path = selectedPath, mode?: DropMode) => {
@@ -334,7 +520,12 @@ export function App() {
           <a className="button" href="/swagger">
             API
           </a>
-          <button type="button" onClick={refresh}>
+          {catalogWarning && (
+            <span className="connection-warning" role="status">
+              {catalogWarning}
+            </span>
+          )}
+          <button type="button" onClick={() => Promise.all([refreshCatalogs(true), refresh()])}>
             <RefreshCw size={16} />
             刷新
           </button>
@@ -344,11 +535,35 @@ export function App() {
       <main className={`app-main view-${view}`}>
         {view === 'runs' && (
           <RunsPage
+            batches={batches}
+            total={batchTotal}
+            offset={batchOffset}
+            pageSize={BATCH_PAGE_SIZE}
+            pageLoading={pageLoading}
+            onPageChange={async (offset) => {
+              setPageLoading(true);
+              setView('runs');
+              try {
+                await refresh({ offset, focusBatchId: null });
+              } finally {
+                setPageLoading(false);
+              }
+            }}
             runs={visibleRuns}
             cases={cases}
             capabilities={capabilities}
             expandedRunId={expandedRunId}
+            focusBatchId={focusBatchId}
             now={now}
+            onCancelBatch={async (id) => {
+              try {
+                await cancelBatch(id);
+                setStatus('已请求取消批次');
+                await refresh();
+              } catch (error) {
+                setStatus(errorMessage(error));
+              }
+            }}
             onCancel={cancelActiveRun}
             onToggle={(item: UnifiedRun) => {
               if (expandedRunId === item.run.id) {
@@ -363,23 +578,66 @@ export function App() {
           />
         )}
         {view === 'cases' && (
-          <CasesPage cases={cases} onCreate={resetCase} onEdit={editCase} onStartRun={startRun} onRemove={removeCase} />
+          <CasesPage
+            cases={cases}
+            onCreate={resetCase}
+            onEdit={editCase}
+            onStartBatch={startBatch}
+            onRemove={removeCase}
+          />
+        )}
+        {view === 'groups' && (
+          <GroupsPage
+            groups={groups}
+            cases={cases}
+            onStart={startGroup}
+            onSave={async (id, body) => {
+              const saved = id ? await updateGroup(id, body) : await createGroup(body);
+              await refreshCatalogs();
+              setGroups((current) =>
+                current.some((group) => group.id === saved.id)
+                  ? current.map((group) => (group.id === saved.id ? saved : group))
+                  : [...current, saved],
+              );
+              return saved;
+            }}
+            onRemove={async (group) => {
+              await deleteGroup(group.id);
+              await refreshCatalogs();
+              setGroups((current) => current.filter((item) => item.id !== group.id));
+            }}
+          />
         )}
         {view === 'workers' && (
           <WorkersPage
             workers={workers}
-            runs={runs}
+            runs={workerRuns}
             cases={cases}
-            onOpenRun={(runId) => {
-              const item = unifiedRuns.find((entry) => entry.run.id === runId);
-              applyRunSelection(runId, item ? { snapshot: item, missingSuccessfulPolls: 0 } : null);
-              setView('runs');
+            onOpenRun={async (runId) => {
+              try {
+                const run =
+                  workerRuns.find((run) => run.id === runId) ??
+                  (await listRuns({ status: ['running', 'canceling'], limit: workers.length, offset: 0 })).items.find(
+                    (run) => run.id === runId,
+                  );
+                if (!run) throw new Error(`Run ${runId} 已结束，请刷新 Workers`);
+                applyRunSelection(runId, {
+                  snapshot: { kind: 'active', run },
+                  missingSuccessfulPolls: 0,
+                });
+                window.location.hash = `#/runs/${encodeURIComponent(run.batchId)}`;
+              } catch (error) {
+                setStatus(errorMessage(error));
+              }
             }}
           />
         )}
         {view === 'builder' && (
           <BuilderPage
             caseName={caseName}
+            caseDescription={caseDescription}
+            onCaseDescriptionChange={setCaseDescription}
+            adapters={adapters}
             capabilities={capabilities}
             definition={draft}
             definitionText={definitionText}
@@ -400,9 +658,17 @@ export function App() {
             onUpdateVariable={updateVariable}
             onUpdateSwitchCase={updateSwitchCase}
             onRemoveSwitchCase={removeSwitchCase}
+            onUpdateSessions={applySessions}
           />
         )}
       </main>
+      {batchSelection && (
+        <BatchCreateDialog
+          selectionLabel={batchSelection.label}
+          onCreate={(metadata) => enqueueRuns({ ...batchSelection.selector, ...metadata })}
+          onClose={() => setBatchSelection(null)}
+        />
+      )}
     </>
   );
 }

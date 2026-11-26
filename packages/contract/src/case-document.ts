@@ -140,9 +140,30 @@ export const caseDocumentSchema = z
   .object({
     main: z.string().trim().min(1),
     trees: z.record(recordKey, treeSchema),
+    sessions: z.array(
+      z
+        .object({
+          adapter: z.string().trim().min(1),
+          actor: z.string().trim().min(1),
+          ports: portBindings.optional(),
+        })
+        .strict(),
+    ),
   })
   .strict()
   .superRefine((value, ctx) => {
+    const seen = new Set<string>();
+    for (const [index, session] of value.sessions.entries()) {
+      const key = `${session.adapter}\0${session.actor}`;
+      if (seen.has(key)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `session ${session.adapter}/${session.actor} is declared more than once`,
+          path: ['sessions', index],
+        });
+      }
+      seen.add(key);
+    }
     try {
       for (const [name, tree] of Object.entries(value.trees)) {
         assertSubTreeAcyclic(tree, value.trees, `root.trees.${name}`, [name]);

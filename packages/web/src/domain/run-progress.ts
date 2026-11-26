@@ -22,6 +22,16 @@ export type SelectedRunCache = {
   missingSuccessfulPolls: 0 | 1;
 };
 
+export function preferNewerRun(current: Run | undefined, incoming: Run): Run {
+  if (!current || current.id !== incoming.id) return incoming;
+  return incoming.revision >= current.revision ? incoming : current;
+}
+
+export function mergeIncomingRuns(previous: readonly Run[], incoming: readonly Run[]): Run[] {
+  const known = new Map(previous.map((run) => [run.id, run]));
+  return incoming.map((run) => preferNewerRun(known.get(run.id), run));
+}
+
 export function mergeRuns(runs: readonly Run[]): UnifiedRun[] {
   const byId = new Map<string, UnifiedRun>();
   for (const run of runs) {
@@ -62,7 +72,10 @@ export function advanceSelectedRunSnapshot(
   if (!expandedRunId) return { cache: null, expired: false };
   const current = runs.find(({ run }) => run.id === expandedRunId);
   if (current) {
-    return { cache: { snapshot: current, missingSuccessfulPolls: 0 }, expired: false };
+    const cached = cache?.snapshot.run.id === expandedRunId ? cache.snapshot.run : undefined;
+    const run = preferNewerRun(cached, current.run);
+    const snapshot: UnifiedRun = { kind: LIVE_STATUSES.has(run.status) ? 'active' : 'finished', run };
+    return { cache: { snapshot, missingSuccessfulPolls: 0 }, expired: false };
   }
   if (cache?.snapshot.run.id !== expandedRunId || cache.missingSuccessfulPolls >= 1) {
     return { cache: null, expired: true };

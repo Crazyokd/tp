@@ -18,6 +18,7 @@ type _RunLacksTreeProgress = AssertTrue<LacksKey<Run, 'treeProgress'>>;
 type _HttpRunLacksDefinition = AssertTrue<LacksKey<Run, 'definition'>>;
 type _CtxHasRoot = AssertTrue<HasKey<AdapterSessionContext, 'resourceRoot'>>;
 type _CtxHasRecord = AssertTrue<HasKey<AdapterSessionContext, 'recordArtifact'>>;
+type _CtxHasInput = AssertTrue<HasKey<AdapterSessionContext, 'input'>>;
 
 const statuses = [
   'queued',
@@ -36,11 +37,13 @@ const definition: CaseDefinition = {
       children: [{ type: 'Action', adapter: 'demo', actor: 'robot', capability: 'go' }],
     },
   },
+  sessions: [{ adapter: 'demo', actor: 'robot', ports: {} }],
 };
 
 function queuedRun(): Run {
   return {
     id: 'run-1',
+    batchId: 'batch-1',
     caseId: 'case-1',
     status: 'queued',
     createdAt: '2026-09-11T00:00:00.000Z',
@@ -51,6 +54,11 @@ function queuedRun(): Run {
     artifacts: [],
   };
 }
+
+test('queued Run requires batchId', () => {
+  const { batchId: _batchId, ...withoutBatch } = queuedRun();
+  assert.throws(() => httpRunSchema.parse(withoutBatch));
+});
 
 test('queued Run parses with empty artifacts', () => {
   const run = queuedRun();

@@ -4,14 +4,14 @@ import { readFile, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { Worker } from 'node:worker_threads';
+import { Worker } from 'node:worker_threads';
 
 import { createRunTree, findRunNode } from '@tp/contract';
 
 import { createAdapterRegistry } from '../src/adapter-registry.ts';
 import { createPlatform } from '../src/platform.ts';
 import { createRunQueue } from '../src/run-queue.ts';
-import { cleanupAdapterSessions } from '../src/session-cleanup.ts';
+import { cleanupAdapterSessions, DEFAULT_SESSION_CLEANUP_TIMEOUT_MS } from '../src/session-cleanup.ts';
 import { createWorkerPool } from '../src/worker-pool.ts';
 import { manifest as testManifest } from './fixtures/test-adapter.ts';
 import { caseDef } from './case-def.ts';
@@ -41,6 +41,7 @@ function fakeQueuedRun(id) {
   const definition = caseDef({ type: 'Action', capability: 'test.fake', adapter: 'test', actor: 'robot' });
   return {
     id,
+    batchId: `batch-${id}`,
     caseId: `case-${id}`,
     status: 'queued',
     createdAt: '2026-09-10T00:00:00.000Z',
@@ -53,7 +54,7 @@ function fakeQueuedRun(id) {
   };
 }
 
-test('a worker thread claims a run and cleans up its adapter session', async () => {
+test('a worker records progress without cloning unrelated trees and cleans up its adapter session', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tp-pool-'));
   const registry = createAdapterRegistry();
   const queue = createRunQueue();
@@ -69,6 +70,19 @@ test('a worker thread claims a run and cleans up its adapter session', async () 
     registry,
     runQueue: queue,
     workspaceRoot: join(dir, 'runs'),
+    workerFactory: (url) =>
+      new Worker(
+        new URL(
+          `data:text/javascript,${encodeURIComponent(`
+            const clone = globalThis.structuredClone;
+            globalThis.structuredClone = (value, options) => {
+              if (value?.main && value?.trees) throw new Error('progress must not clone the entire Run tree');
+              return clone(value, options);
+            };
+            await import(${JSON.stringify(url.href)});
+          `)}`,
+        ),
+      ),
     onProgress: (runId, event) => {
       messageOrder.push(`progress:${event.revision}`);
       queue.applyProgress(runId, event);
@@ -83,19 +97,35 @@ test('a worker thread claims a run and cleans up its adapter session', async () 
     pool.start();
     const created = await platform.createCase({
       name: 'threaded',
+      description: 'threaded',
+
       definition: caseDef({
-        type: 'Action',
-        capability: 'test.pass',
-        adapter: 'test',
-        actor: 'robot1',
-        ports: { markerDir: { literal: dir } },
+        main: 'Main',
+        trees: {
+          Main: {
+            type: 'Action',
+            capability: 'test.pass',
+            adapter: 'test',
+            actor: 'robot1',
+            ports: { markerDir: { literal: dir } },
+          },
+          Unused: {
+            type: 'Sequence',
+            children: Array.from({ length: 1000 }, () => ({
+              type: 'Action',
+              capability: 'test.pass',
+              adapter: 'test',
+              actor: 'robot1',
+            })),
+          },
+        },
       }),
     });
-    const run = await platform.createRun({ caseId: created.id });
+    const [run] = (await platform.createBatch({ trigger: { kind: 'web' }, caseIds: [created.id] })).runs;
     const record = await completed;
 
     assert.equal(record.id, run.id);
-    assert.equal(record.status, 'passed');
+    assert.equal(record.status, 'passed', record.error);
     assert.ok(record.revision > 0);
     assert.equal(findRunNode(record.tree, '').status, 'passed');
     assert.equal(messageOrder.at(-1), 'result');
@@ -135,6 +165,8 @@ test('ParallelAll with two actors creates two adapter sessions', async () => {
     pool.start();
     const created = await platform.createCase({
       name: 'two-actors',
+      description: 'two-actors',
+
       definition: caseDef({
         type: 'ParallelAll',
         children: [
@@ -143,7 +175,7 @@ test('ParallelAll with two actors creates two adapter sessions', async () => {
         ],
       }),
     });
-    const run = await platform.createRun({ caseId: created.id });
+    const [run] = (await platform.createBatch({ trigger: { kind: 'web' }, caseIds: [created.id] })).runs;
     const record = await completed;
 
     assert.equal(record.status, 'passed');
@@ -188,6 +220,8 @@ test('adapter execution errors fail the run without crashing the worker thread',
     pool.start();
     const created = await platform.createCase({
       name: 'failure',
+      description: 'failure',
+
       definition: caseDef({
         type: 'Action',
         capability: 'test.fail',
@@ -196,7 +230,7 @@ test('adapter execution errors fail the run without crashing the worker thread',
         ports: { markerDir: { literal: dir } },
       }),
     });
-    await platform.createRun({ caseId: created.id });
+    await platform.createBatch({ trigger: { kind: 'web' }, caseIds: [created.id] });
 
     const record = await completed;
 
@@ -239,6 +273,8 @@ test('adapter results that violate the contract fail the run', async () => {
     pool.start();
     const created = await platform.createCase({
       name: 'invalid adapter',
+      description: 'invalid adapter',
+
       definition: caseDef({
         type: 'Action',
         capability: 'test.invalid',
@@ -247,7 +283,7 @@ test('adapter results that violate the contract fail the run', async () => {
         ports: { markerDir: { literal: dir } },
       }),
     });
-    await platform.createRun({ caseId: created.id });
+    await platform.createBatch({ trigger: { kind: 'web' }, caseIds: [created.id] });
 
     const record = await completed;
 
@@ -290,6 +326,8 @@ test('failed adapter output must still match its declared output schema', async 
   try {
     const created = await platform.createCase({
       name: 'failed invalid output',
+      description: 'failed invalid output',
+
       definition: caseDef({
         type: 'Action',
         capability: 'test.failed-invalid-output',
@@ -298,7 +336,7 @@ test('failed adapter output must still match its declared output schema', async 
         ports: {},
       }),
     });
-    await platform.createRun({ caseId: created.id });
+    await platform.createBatch({ trigger: { kind: 'web' }, caseIds: [created.id] });
     const record = await completed;
     assert.equal(record.status, 'failed');
     assert.match(String(record.error), /output port ok does not match schema/);
@@ -334,6 +372,8 @@ test('passed adapter result may omit optional output ports', async () => {
     pool.start();
     const created = await platform.createCase({
       name: 'passed missing output',
+      description: 'passed missing output',
+
       definition: caseDef({
         type: 'Action',
         capability: 'test.passed-missing-output',
@@ -342,7 +382,7 @@ test('passed adapter result may omit optional output ports', async () => {
         ports: {},
       }),
     });
-    await platform.createRun({ caseId: created.id });
+    await platform.createBatch({ trigger: { kind: 'web' }, caseIds: [created.id] });
     const record = await completed;
     assert.equal(record.status, 'passed');
   } finally {
@@ -383,9 +423,11 @@ test('worker converts malicious result.error values into cloneable contract fail
         pool.start();
         const created = await platform.createCase({
           name: capability,
+          description: 'test',
+
           definition: caseDef({ type: 'Action', adapter: 'test', actor: 'robot', capability, ports: {} }),
         });
-        await platform.createRun({ caseId: created.id });
+        await platform.createBatch({ trigger: { kind: 'web' }, caseIds: [created.id] });
         const record = await completed;
         assert.equal(record.status, 'failed');
         assert.match(String(record.error), /not cloneable/);
@@ -429,13 +471,15 @@ test('Timeout halt finishes the run and still cleans the adapter session', async
     pool.start();
     const created = await platform.createCase({
       name: 'timeout cleanup',
+      description: 'timeout cleanup',
+
       definition: caseDef({
         type: 'Timeout',
         msec: 1,
         child: { type: 'Action', capability: 'test.worker-fatal', adapter: 'test', actor: 'robot', ports: {} },
       }),
     });
-    const run = await platform.createRun({ caseId: created.id });
+    const [run] = (await platform.createBatch({ trigger: { kind: 'web' }, caseIds: [created.id] })).runs;
     const record = await completed;
     assert.equal(await readFile(join(adapterWorkspace(run.id), 'cleanup.log'), 'utf8'), 'cleanup\n');
     assert.equal(record.status, 'failed');
@@ -448,7 +492,7 @@ test('Timeout halt finishes the run and still cleans the adapter session', async
   }
 });
 
-test('worker cleanup gives two hanging sessions one shared deadline and starts both in parallel', async () => {
+test('worker cleanup stops at a hanging consumer under one shared deadline', async () => {
   const starts: Array<{ id: number; at: number }> = [];
   const sessions = [1, 2].map((id) => ({
     async tick() {
@@ -466,11 +510,47 @@ test('worker cleanup gives two hanging sessions one shared deadline and starts b
 
   assert.deepEqual(
     starts.map(({ id }) => id),
-    [1, 2],
+    [2],
   );
-  assert.ok(Math.max(...starts.map(({ at }) => at)) - Math.min(...starts.map(({ at }) => at)) < 10);
   assert.ok(elapsed >= 15 && elapsed < 100, `shared cleanup deadline elapsed=${elapsed}ms`);
   assert.deepEqual(errors, ['session cleanup timed out after 20ms']);
+});
+
+test('worker pool forwards sessionCleanupTimeoutMs only when configured', async (t) => {
+  for (const scenario of [
+    { configured: undefined, expected: undefined },
+    { configured: 123_000, expected: 123_000 },
+  ]) {
+    await t.test(`configured=${String(scenario.configured)}`, async () => {
+      const worker = new FakeWorker();
+      const queue = createRunQueue();
+      queue.enqueue(fakeQueuedRun('run'));
+      const pool = createWorkerPool({
+        size: 1,
+        registry: createAdapterRegistry(),
+        runQueue: queue,
+        workspaceRoot: '/tmp',
+        ...(scenario.configured === undefined ? {} : { sessionCleanupTimeoutMs: scenario.configured }),
+        workerFactory: () => worker as unknown as Worker,
+        onProgress: (runId, event) => {
+          queue.applyProgress(runId, event);
+        },
+        onResult: async () => undefined,
+        onFatal: () => undefined,
+      });
+      pool.start();
+      worker.send({ type: 'ready' });
+      await new Promise((resolve) => setImmediate(resolve));
+      const runMessage = worker.posted.find(({ type }) => type === 'run');
+      assert.ok(runMessage);
+      assert.equal(runMessage.sessionCleanupTimeoutMs, scenario.expected);
+      await pool.close();
+    });
+  }
+});
+
+test('default session cleanup budget covers docker stop grace periods', () => {
+  assert.ok(DEFAULT_SESSION_CLEANUP_TIMEOUT_MS >= 60_000);
 });
 
 test('hanging session cleanup after Timeout is bounded', async () => {
@@ -500,6 +580,8 @@ test('hanging session cleanup after Timeout is bounded', async () => {
     pool.start();
     const created = await platform.createCase({
       name: 'timeout hanging cleanup',
+      description: 'timeout hanging cleanup',
+
       definition: caseDef({
         type: 'Timeout',
         msec: 1,
@@ -512,7 +594,7 @@ test('hanging session cleanup after Timeout is bounded', async () => {
         },
       }),
     });
-    await platform.createRun({ caseId: created.id });
+    await platform.createBatch({ trigger: { kind: 'web' }, caseIds: [created.id] });
     const startedAt = Date.now();
     const record = await completed;
     assert.ok(Date.now() - startedAt < 3_000);

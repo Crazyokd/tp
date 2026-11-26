@@ -12,7 +12,9 @@ import {
   elapsedRunMs,
   formatDuration,
   formatJson,
+  mergeIncomingRuns,
   mergeRuns,
+  preferNewerRun,
   runDurationMs,
   runTreeFromRun,
   selectRunId,
@@ -39,11 +41,16 @@ const definition: CaseDefinition = {
       ],
     },
   },
+  sessions: [
+    { adapter: 'demo', actor: 'robot-1', ports: {} },
+    { adapter: 'demo', actor: 'robot', ports: {} },
+  ],
 };
 
 function active(overrides: Partial<Run> & Pick<Run, 'id'>): Run {
   return {
     id: overrides.id,
+    batchId: 'batch-1',
     caseId: 'case-1',
     createdAt: '2026-09-10T00:00:00.000Z',
     startedAt: null,
@@ -59,6 +66,7 @@ function active(overrides: Partial<Run> & Pick<Run, 'id'>): Run {
 function finished(overrides: Partial<Run> & Pick<Run, 'id'>): Run {
   return {
     id: overrides.id,
+    batchId: 'batch-1',
     caseId: 'case-1',
     createdAt: '2026-09-10T00:00:00.000Z',
     startedAt: '2026-09-10T00:00:01.000Z',
@@ -70,6 +78,21 @@ function finished(overrides: Partial<Run> & Pick<Run, 'id'>): Run {
     ...overrides,
   };
 }
+
+test('list snapshots cannot overwrite a newer watched revision', () => {
+  const watched = active({ id: 'live', status: 'running', revision: 4 });
+  const stale = active({ id: 'live', status: 'queued', revision: 1 });
+  assert.equal(preferNewerRun(watched, stale).revision, 4);
+  assert.deepEqual(mergeIncomingRuns([watched], [stale, active({ id: 'other', revision: 0 })]), [
+    watched,
+    active({ id: 'other', revision: 0 }),
+  ]);
+  const cached = advanceSelectedRunSnapshot(mergeRuns([stale]), 'live', {
+    snapshot: mergeRuns([watched])[0]!,
+    missingSuccessfulPolls: 0,
+  });
+  assert.equal(cached.cache?.snapshot.run.revision, 4);
+});
 
 test('mergeRuns de-duplicates by id with later items winning and sorts active before history', () => {
   const duplicateActive = active({ id: 'same', status: 'running', createdAt: '2026-09-10T00:09:00.000Z' });
@@ -164,19 +187,20 @@ test('edited Case still draws old run', () => {
         children: [{ type: 'Action', capability: 'other.act', adapter: 'demo', actor: 'robot', ports: {} }],
       },
     },
+    sessions: [{ adapter: 'demo', actor: 'robot', ports: {} }],
   };
   const run = finished({ id: 'edited-case', tree: createRunTree(definition) });
   const result = runTreeFromRun(run);
 
-  assert.deepEqual(stripRunTree(run.tree), definition);
-  assert.deepEqual(result.graphDefinition, definition);
-  assert.notDeepEqual(stripRunTree(run.tree), changed);
+  assert.deepEqual(stripRunTree(run.tree).trees, definition.trees);
+  assert.deepEqual(result.graphDefinition.trees, definition.trees);
+  assert.notDeepEqual(stripRunTree(run.tree).trees, changed.trees);
 });
 
 test('runTreeFromRun graph matches the definition used at create', () => {
   const tree = createRunTree(definition);
   const run = finished({ id: 'roundtrip', tree });
-  assert.deepEqual(runTreeFromRun(run).graphDefinition, definition);
+  assert.deepEqual(runTreeFromRun(run).graphDefinition.trees, definition.trees);
 });
 
 test('runTreeFromRun accepts an Inverter definition without numeric wrapper fields', () => {
@@ -188,6 +212,7 @@ test('runTreeFromRun accepts an Inverter definition without numeric wrapper fiel
         child: { type: 'Action', capability: 'demo.move', adapter: 'demo', actor: 'robot', ports: {} },
       },
     },
+    sessions: [{ adapter: 'demo', actor: 'robot', ports: {} }],
   };
   const run = active({
     id: 'invert',
@@ -195,7 +220,7 @@ test('runTreeFromRun accepts an Inverter definition without numeric wrapper fiel
   });
   const result = runTreeFromRun(run);
 
-  assert.deepEqual(result.graphDefinition, inverter);
+  assert.deepEqual(result.graphDefinition.trees, inverter.trees);
   assert.equal(findRunNode(result.tree, '').type, 'Inverter');
   assert.equal(findRunNode(result.tree, 'child').type, 'Action');
 });
@@ -263,6 +288,7 @@ test('node presentation hides a single execution and labels Retry as current/max
         },
       },
     },
+    sessions: [{ adapter: 'demo', actor: 'robot', ports: {} }],
   };
   const tree = createRunTree(retryDefinition);
   const retryRoot = retryDefinition.trees.Main;
@@ -315,6 +341,7 @@ test('status counts and elapsed calculations are complete, immutable, and never 
     trees: {
       Main: { type: 'Condition', capability: 'demo.check', adapter: 'demo', actor: 'robot', ports: {} },
     },
+    sessions: [{ adapter: 'demo', actor: 'robot', ports: {} }],
   });
   findRunNode(canceled, '').status = 'canceled';
   const before = structuredClone(tree);
@@ -400,6 +427,9 @@ test('App presents a single non-overlapping Runs poll and expands newly created 
   const styles = await readFile('src/styles.css', 'utf8');
 
   assert.match(runs, /Runs List/);
+  assert.match(runs, /run-fold/);
+  assert.doesNotMatch(runs, /groupRuns/);
+  assert.match(source, /listBatches/);
   assert.match(source, /defaultExpandedRunId/);
   assert.doesNotMatch(source, /selectRunId/);
   assert.match(source, /applyRunSelection\(run\.id/);

@@ -17,6 +17,7 @@ function queuedRun(
 ): LiveRun {
   return {
     id,
+    batchId: `batch-${id}`,
     caseId: `case-${id}`,
     status: 'queued',
     createdAt: '2026-09-09T00:00:00.000Z',
@@ -28,6 +29,28 @@ function queuedRun(
     definition,
   };
 }
+
+test('queue exposes compact statuses and clones only requested Run snapshots', () => {
+  const queue = createRunQueue();
+  queue.enqueue(queuedRun('first'));
+  queue.enqueue(queuedRun('second'));
+  queue.claimNext();
+  const statuses = queue.statuses();
+  assert.deepEqual(statuses, [
+    { id: 'first', status: 'running' },
+    { id: 'second', status: 'queued' },
+  ]);
+  statuses[0]!.status = 'canceled';
+  assert.equal(queue.get('first').status, 'running');
+  assert.deepEqual(queue.list(new Set()), []);
+  const selected = queue.list(new Set(['second']));
+  assert.deepEqual(
+    selected.map((run) => run.id),
+    ['second'],
+  );
+  selected[0]!.tree.main = 'changed';
+  assert.equal(queue.get('second').tree.main, 'Main');
+});
 
 test('workers claim queued runs in FIFO order without worker identity', () => {
   const queue = createRunQueue();
@@ -92,6 +115,49 @@ test('applies progress to the one internal snapshot with clone-isolated reads', 
   assert.equal(queue.get('run-1').revision, 1);
   assert.equal(findRunNode(queue.get('run-1').tree, '').status, 'running');
   assert.equal(findRunNode(queue.get('run-1').tree, '').attempts[0]!.status, 'running');
+});
+
+test('recordProgress stores every event without cloning a tree or serializing a Run', (t) => {
+  const queue = createRunQueue();
+  queue.enqueue(queuedRun('run-1'));
+  queue.claimNext();
+  const clone = globalThis.structuredClone;
+  const cloneSpy = t.mock.method(globalThis, 'structuredClone', (value, options) => {
+    assert.equal(value?.trees, undefined, 'progress must not clone the entire tree');
+    return clone(value, options);
+  });
+  const stringifySpy = t.mock.method(JSON, 'stringify', () => assert.fail('progress must not serialize a Run'));
+  const started: RunNodeProgressEvent = {
+    revision: 1,
+    kind: 'started',
+    path: '',
+    nodeType: 'Action',
+    attempt: 1,
+    capability: 'demo.mapping.start',
+    actor: 'robot',
+    timestamp: '2026-09-10T00:00:00.000Z',
+  };
+  assert.equal(queue.recordProgress('run-1', started), undefined);
+  assert.throws(() => queue.recordProgress('run-1', started), /expected revision 2/);
+  const output = { map: { id: 1 } };
+  queue.recordProgress('run-1', {
+    revision: 2,
+    kind: 'finished',
+    path: '',
+    nodeType: 'Action',
+    attempt: 1,
+    timestamp: '2026-09-10T00:00:01.000Z',
+    status: 'passed',
+    output,
+  });
+  output.map.id = 2;
+  stringifySpy.mock.restore();
+  cloneSpy.mock.restore();
+  const snapshot = queue.get('run-1');
+  assert.equal(snapshot.revision, 2);
+  assert.equal(findRunNode(snapshot.tree, '').status, 'passed');
+  assert.deepEqual(findRunNode(snapshot.tree, '').attempts[0]?.output, { map: { id: 1 } });
+  assert.equal(snapshot.status, 'running');
 });
 
 test('markCanceling transitions only a running run to canceling', () => {

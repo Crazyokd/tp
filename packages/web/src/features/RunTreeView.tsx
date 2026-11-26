@@ -84,11 +84,13 @@ export function createRunNodePresentation(
     const adapter = item.type === 'Action' || item.type === 'Condition' ? item.adapter : undefined;
     const label =
       capability && adapter ? (capabilityLabels.get(`${adapter}::${capability}`) ?? capability) : capability;
+    // attempts 只保留最近若干条（contract MAX_STORED_RUN_ATTEMPTS），
+    // 已执行次数取末条编号而非数组长度。
     const retryCount =
       node.type === 'RetryUntilSuccessful'
-        ? findRunNode(tree, path ? `${path}.child` : 'child').attempts.length
+        ? (findRunNode(tree, path ? `${path}.child` : 'child').attempts.at(-1)?.attempt ?? 0)
         : undefined;
-    const executed = retryCount ?? item.attempts.length;
+    const executed = retryCount ?? item.attempts.at(-1)?.attempt ?? 0;
     return {
       status: item.status,
       statusLabel: `${status.icon} ${status.label}`,

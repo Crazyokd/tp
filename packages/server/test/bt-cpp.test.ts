@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { setImmediate as yieldImmediate } from 'node:timers/promises';
 
 import { executeTree as executeDocument, WorkerFatalError } from '../src/bt.ts';
 import type { CaseDefinition, NodeStatusResult, LeafNode, TreeNode } from '@tp/contract';
@@ -10,6 +11,36 @@ function executeTree(definition: TreeNode | CaseDefinition, options?: Parameters
     adapter: testLeafAdapter,
     capabilities: leafCapabilities(definition),
     ...options,
+  });
+}
+
+for (const scenario of [
+  { interval: 5, status: 'passed', ticks: 2 },
+  { interval: 60, status: 'failed', ticks: 1 },
+] as const) {
+  test(`Timeout accepts a condition result only before its deadline (${scenario.interval}ms tick)`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let ticks = 0;
+    const tree = executeTree(
+      {
+        type: 'Timeout',
+        msec: 10,
+        child: {
+          type: 'RetryUntilSuccessful',
+          num_attempts: -1,
+          child: { type: 'Condition', adapter: 'test', actor: 'robot', capability: 'ready' },
+        },
+      },
+      {
+        tickIntervalMs: scenario.interval,
+        adapter: async () => ({ status: ++ticks === 1 ? 'FAILURE' : 'SUCCESS' }),
+      },
+    );
+    await yieldImmediate();
+    t.mock.timers.tick(scenario.interval);
+    const result = await tree;
+    assert.equal(result.status, scenario.status);
+    assert.equal(ticks, scenario.ticks);
   });
 }
 

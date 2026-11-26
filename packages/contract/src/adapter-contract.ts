@@ -36,6 +36,7 @@ export type AdapterManifest = {
   id: string;
   moduleEntry: string;
   capabilities: CapabilityDefinition[];
+  session?: { ports: PortDefinition[] };
 };
 
 export type RecordArtifactInput = {
@@ -49,6 +50,7 @@ export type AdapterSessionContext = {
   actor: string;
   resourceRoot: string;
   recordArtifact(input: RecordArtifactInput): { id: string };
+  input: Record<string, unknown>;
 };
 
 export type AdapterSession = {
@@ -73,6 +75,27 @@ export const portDefinitionSchema: z.ZodType<PortDefinition> = z
   })
   .strict();
 
+const sessionPortsSchema = z.array(portDefinitionSchema).superRefine((ports, ctx) => {
+  const names = new Set<string>();
+  for (const [index, port] of ports.entries()) {
+    if (port.direction !== 'in') {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'session ports must use direction in',
+        path: [index, 'direction'],
+      });
+    }
+    if (names.has(port.name)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `session port ${port.name} is declared more than once`,
+        path: [index, 'name'],
+      });
+    }
+    names.add(port.name);
+  }
+});
+
 export const adapterManifestSchema: z.ZodType<AdapterManifest> = z
   .object({
     id: z.string().trim().min(1),
@@ -87,5 +110,6 @@ export const adapterManifestSchema: z.ZodType<AdapterManifest> = z
         })
         .strict(),
     ),
+    session: z.object({ ports: sessionPortsSchema }).strict().optional(),
   })
   .strict();

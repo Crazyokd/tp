@@ -3,26 +3,33 @@ import {
   apiErrorSchema,
   apiPaths,
   casePath,
+  groupPath,
+  httpGroupWriteSchema,
   httpAdapterSchema,
   httpCaseSchema,
   httpCaseWriteSchema,
-  httpRunCreateSchema,
+  httpBatchCreateSchema,
+  httpBatchImportSchema,
+  batchPath,
+  batchCancelPath,
+  type Batch,
   httpRunSchema,
   httpWorkerSchema,
   operations,
   runArtifactPath,
   runCancelPath,
-  runPath,
+  runEventsPath,
   workerPath,
   type HttpOperation,
   type Run,
   type RunStatus,
   type TestCase,
+  type TestGroup,
 } from '@tp/contract';
 import type { z } from 'zod';
 
 type Page<T> = { items: T[]; total: number };
-type HttpAdapter = z.infer<typeof httpAdapterSchema>;
+export type HttpAdapter = z.infer<typeof httpAdapterSchema>;
 type HttpCase = z.infer<typeof httpCaseSchema>;
 type HttpRun = z.infer<typeof httpRunSchema>;
 type HttpWorker = z.infer<typeof httpWorkerSchema>;
@@ -114,6 +121,39 @@ export async function deleteCase(id: string): Promise<void> {
   await parseResponse(operation('deleteCase'), await send(operation('deleteCase'), casePath(id), { method: 'DELETE' }));
 }
 
+export async function listGroups(): Promise<Page<TestGroup>> {
+  return parseResponse(operation('listGroups'), await send(operation('listGroups'), apiPaths.groups));
+}
+
+export async function createGroup(body: unknown): Promise<TestGroup> {
+  return parseResponse(
+    operation('createGroup'),
+    await send(operation('createGroup'), apiPaths.groups, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(httpGroupWriteSchema.parse(body)),
+    }),
+  );
+}
+
+export async function updateGroup(id: string, body: unknown): Promise<TestGroup> {
+  return parseResponse(
+    operation('updateGroup'),
+    await send(operation('updateGroup'), groupPath(id), {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(httpGroupWriteSchema.parse(body)),
+    }),
+  );
+}
+
+export async function deleteGroup(id: string): Promise<void> {
+  await parseResponse(
+    operation('deleteGroup'),
+    await send(operation('deleteGroup'), groupPath(id), { method: 'DELETE' }),
+  );
+}
+
 export async function listRuns(query?: PageQuery & { status?: RunStatus[] }): Promise<Page<HttpRun>> {
   const url = new URL(apiPaths.runs, window.location.origin);
   for (const status of query?.status ?? []) url.searchParams.append('status', status);
@@ -121,19 +161,43 @@ export async function listRuns(query?: PageQuery & { status?: RunStatus[] }): Pr
   return parseResponse(operation('listRuns'), await send(operation('listRuns'), requestUrl(url)));
 }
 
-export async function createRun(body: unknown): Promise<HttpRun> {
+export async function listBatches(query?: PageQuery): Promise<Page<Batch>> {
+  const url = new URL(apiPaths.batches, window.location.origin);
+  withPage(url, query);
+  return parseResponse(operation('listBatches'), await send(operation('listBatches'), requestUrl(url)));
+}
+
+export async function getBatch(id: string): Promise<Batch> {
+  return parseResponse(operation('getBatch'), await send(operation('getBatch'), batchPath(id)));
+}
+
+export async function createBatch(body: unknown): Promise<Batch> {
   return parseResponse(
-    operation('createRun'),
-    await send(operation('createRun'), apiPaths.runs, {
+    operation('createBatch'),
+    await send(operation('createBatch'), apiPaths.batches, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(httpRunCreateSchema.parse(body)),
+      body: JSON.stringify(httpBatchCreateSchema.parse(body)),
     }),
   );
 }
 
-export async function getRun(id: string): Promise<HttpRun> {
-  return parseResponse(operation('getRun'), await send(operation('getRun'), runPath(id)));
+export async function importBatch(body: unknown): Promise<Batch> {
+  return parseResponse(
+    operation('importBatch'),
+    await send(operation('importBatch'), `${apiPaths.batches}/import`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(httpBatchImportSchema.parse(body)),
+    }),
+  );
+}
+
+export async function cancelBatch(id: string): Promise<Batch> {
+  return parseResponse(
+    operation('cancelBatch'),
+    await send(operation('cancelBatch'), batchCancelPath(id), { method: 'POST' }),
+  );
 }
 
 export async function cancelRun(id: string): Promise<HttpRun> {
@@ -153,5 +217,5 @@ export async function getWorker(id: string): Promise<HttpWorker> {
   return parseResponse(operation('getWorker'), await send(operation('getWorker'), workerPath(id)));
 }
 
-export { runArtifactPath };
+export { runArtifactPath, runEventsPath };
 export type { Run, TestCase };

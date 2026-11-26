@@ -166,13 +166,13 @@ test('rejects an unregistered leaf in an unreferenced tree', () => {
   assert.throws(
     () =>
       validateDefinition(
-        {
+        caseDef({
           main: 'Main',
           trees: {
             Main: { type: 'Sequence', children: [leaf('Action', 'test.pass')] },
             Dead: leaf('Action', 'unknown.action'),
           },
-        },
+        }),
         testRegistry(),
       ),
     /root\.trees\.Dead\.capability test\/unknown.action is not registered/,

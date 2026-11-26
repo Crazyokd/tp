@@ -66,7 +66,7 @@ function successResponse(operation: HttpOperation): Record<string, unknown> {
     return {
       description: 'OK',
       content: {
-        'application/octet-stream': {},
+        [operation.id === 'watchRun' ? 'text/event-stream' : 'application/octet-stream']: {},
       },
     };
   }
@@ -85,6 +85,14 @@ function successResponse(operation: HttpOperation): Record<string, unknown> {
 
 function operationObject(operation: HttpOperation): Record<string, unknown> {
   const parameters = [...pathParameters(operation.path), ...queryParameters(operation.query)];
+  if (operation.id === 'watchRun') {
+    parameters.push({
+      name: 'Last-Event-ID',
+      in: 'header',
+      required: false,
+      schema: { type: 'string' },
+    });
+  }
   const documented: Record<string, unknown> = {
     tags: [operation.tag],
     operationId: operation.id,

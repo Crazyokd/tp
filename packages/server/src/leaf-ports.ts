@@ -1,8 +1,26 @@
-import { matchesJsonSchema, type JsonObject, type LeafNode, type PortBinding } from '@tp/contract';
+import { matchesJsonSchema, type JsonObject, type LeafNode, type PortBinding, type SessionBinding } from '@tp/contract';
 import type { CapabilityDefinition, PortDefinition } from '@tp/contract/adapter';
 
 export class MissingLeafInputError extends Error {}
 export class InvalidLeafOutputError extends Error {}
+
+export function assembleSessionInput(
+  binding: SessionBinding,
+  ports: readonly PortDefinition[],
+  lookup: (key: string) => unknown,
+): JsonObject {
+  return assembleLeafInput(
+    {
+      type: 'Action',
+      adapter: binding.adapter,
+      actor: binding.actor,
+      capability: 'session',
+      ports: binding.ports,
+    },
+    { key: 'session', kind: 'Action', label: 'session', ports: [...ports] },
+    lookup,
+  );
+}
 
 export function assembleLeafInput(
   leaf: LeafNode,

@@ -2,7 +2,6 @@
   "name": "tp",
   "version": "0.1.0",
   "private": true,
-  "license": "Apache-2.0",
   "type": "module",
   "workspaces": [
     "packages/*",
@@ -22,7 +21,7 @@
     "test:root": "node --import tsx --test --test-concurrency=8 test/*.test.ts"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12.0"
   },
   "devDependencies": {
     "@types/node": "^26.4.1",
@@ -30,5 +29,6 @@
     "prettier": "^3.9.6",
     "tsx": "^4.23.13",
     "typescript": "^7.0.2"
-  }
+  },
+  "license": "Apache-2.0"
 }

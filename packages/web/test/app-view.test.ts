@@ -2,25 +2,38 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 
-import { appViewHash, parseAppView } from '../src/domain/app-view.ts';
+import { appViewHash, parseAppLocation } from '../src/domain/app-view.ts';
 
-test('parseAppView treats empty and unknown hashes as runs', () => {
-  assert.equal(parseAppView(''), 'runs');
-  assert.equal(parseAppView('#'), 'runs');
-  assert.equal(parseAppView('#/unknown'), 'runs');
-  assert.equal(parseAppView('#runs'), 'runs');
+test('parseAppLocation treats empty and unknown hashes as runs', () => {
+  assert.equal(parseAppLocation('').view, 'runs');
+  assert.equal(parseAppLocation('#').view, 'runs');
+  assert.equal(parseAppLocation('#/unknown').view, 'runs');
+  assert.equal(parseAppLocation('#runs').view, 'runs');
 });
 
-test('parseAppView recognizes the three module hashes', () => {
-  assert.equal(parseAppView('#/runs'), 'runs');
-  assert.equal(parseAppView('#/cases'), 'cases');
-  assert.equal(parseAppView('#/builder'), 'builder');
-  assert.equal(parseAppView('#/workers'), 'workers');
+test('parseAppLocation recognizes module hashes', () => {
+  assert.equal(parseAppLocation('#/runs').view, 'runs');
+  assert.equal(parseAppLocation('#/cases').view, 'cases');
+  assert.equal(parseAppLocation('#/groups').view, 'groups');
+  assert.equal(parseAppLocation('#/builder').view, 'builder');
+  assert.equal(parseAppLocation('#/workers').view, 'workers');
+});
+
+test('parseAppLocation keeps a run batch permalink on the runs view', () => {
+  assert.deepEqual(parseAppLocation('#/runs/ci-196497-1072596'), {
+    view: 'runs',
+    batchId: 'ci-196497-1072596',
+  });
+  assert.deepEqual(parseAppLocation('#/runs/batch%20a'), { view: 'runs', batchId: 'batch a' });
+  assert.deepEqual(parseAppLocation('#/runs'), { view: 'runs', batchId: null });
+  assert.deepEqual(parseAppLocation('#/cases'), { view: 'cases', batchId: null });
+  assert.equal(parseAppLocation('#/runs/ci-1').view, 'runs');
 });
 
 test('appViewHash writes the matching location hash', () => {
   assert.equal(appViewHash('runs'), '#/runs');
   assert.equal(appViewHash('cases'), '#/cases');
+  assert.equal(appViewHash('groups'), '#/groups');
   assert.equal(appViewHash('builder'), '#/builder');
   assert.equal(appViewHash('workers'), '#/workers');
 });
@@ -41,12 +54,18 @@ test('App shell shows one module at a time and keeps create-run on the current p
   assert.match(app, /id: 'workers'/);
   assert.match(app, /listWorkers/);
   assert.doesNotMatch(app, /workerId/);
-  assert.match(app, /parseAppView/);
+  assert.match(app, /parseAppLocation/);
   assert.match(app, /appViewHash/);
   assert.doesNotMatch(app, /grid-template-columns: minmax\(0, 1fr\) 360px/);
 
   assert.match(cases, /data-testid="cases-page"/);
   assert.match(builder, /data-testid="builder-page"/);
+  assert.match(builder, /data-testid="sessions-panel"/);
+  assert.doesNotMatch(builder, /data-testid="session-add"/);
+  assert.doesNotMatch(builder, /data-testid="session-remove"/);
+  assert.doesNotMatch(builder, /data-testid="session-adapter"/);
+  assert.doesNotMatch(builder, /data-testid="session-actor"/);
+  assert.match(builder, /session-port-/);
   assert.match(builder, /data-testid="bt-editor"/);
   assert.match(builder, /data-testid="node-type"/);
   assert.match(builder, /data-testid="builder-view"/);
@@ -71,4 +90,17 @@ test('App shell shows one module at a time and keeps create-run on the current p
   assert.match(app, /setView\('builder'\)/);
   assert.match(app, /requireCaseDefinition\(item\.definition\)/);
   assert.doesNotMatch(app, /setView\('runs'\).*\/api\/runs/);
+});
+
+test('malformed and incomplete batch links follow unknown-hash routing', () => {
+  for (const hash of ['#/runs/%', '#/runs/%E0%A4%A', '#/runs/', '#/runs/batch/extra']) {
+    assert.deepEqual(parseAppLocation(hash), { view: 'runs', batchId: null });
+  }
+  assert.deepEqual(parseAppLocation('#/groups'), { view: 'groups', batchId: null });
+});
+
+test('batch links preserve exact imported IDs', () => {
+  for (const id of ['测试/a', 'a\u0000b', 'a�b', 'quote"bracket]', 'back\\slash']) {
+    assert.deepEqual(parseAppLocation(`#/runs/${encodeURIComponent(id)}`), { view: 'runs', batchId: id });
+  }
 });

@@ -10,25 +10,33 @@ Generic test platform. The server exposes adapter capabilities, workers execute 
 
 ## Run
 
-Requires Node 22+ and npm. Browser runs require Chromium:
+Requires Node.js 22.12 or later and npm. Browser runs require Chromium:
 
 ```bash
-npm install
+npm ci
 npx playwright install chromium
-npm run server          # :3000, loads Browser adapter
+HOST=127.0.0.1 npm run server  # :3000, loads Browser adapter
 npm run dev             # :5173, proxies /api to :3000
 ```
 
-In another shell, create and run a Browser smoke case:
+In another shell, create a Browser smoke case and start a Batch:
 
 ```bash
 CASE_ID=$(
-  curl -sS -X POST http://127.0.0.1:3000/api/cases \
+  curl -fsS -X POST http://127.0.0.1:3000/api/cases \
     -H 'content-type: application/json' \
     --data '{
       "name": "Browser smoke",
+      "description": "Verify that the TP page loads",
       "definition": {
         "main": "Main",
+        "sessions": [
+          {
+            "adapter": "browser",
+            "actor": "browser",
+            "ports": { "origin": { "literal": "http://127.0.0.1:5173" } }
+          }
+        ],
         "trees": {
           "Main": {
             "type": "Sequence",
@@ -39,7 +47,7 @@ CASE_ID=$(
                 "actor": "browser",
                 "capability": "browser.goto",
                 "ports": {
-                  "url": { "literal": "http://127.0.0.1:5173/" }
+                  "url": { "literal": "/" }
                 }
               },
               {
@@ -60,16 +68,23 @@ CASE_ID=$(
     | node -pe 'JSON.parse(require("node:fs").readFileSync(0, "utf8")).id'
 )
 
-curl -sS -X POST http://127.0.0.1:3000/api/runs \
-  -H 'content-type: application/json' \
-  --data "{\"caseId\":\"$CASE_ID\"}"
+BATCH_ID=$(
+  curl -fsS -X POST http://127.0.0.1:3000/api/batches \
+    -H 'content-type: application/json' \
+    --data "{\"caseIds\":[\"$CASE_ID\"],\"trigger\":{\"kind\":\"ci\"}}" \
+    | node -pe 'JSON.parse(require("node:fs").readFileSync(0, "utf8")).id'
+)
+
+curl -fsS "http://127.0.0.1:3000/api/batches/$BATCH_ID"
 ```
 
-Production-style local run:
+Refresh the Batch until its `status` is `passed`. In the Runs page you can expand its member Run to see the behavior tree and the Browser recording.
+
+To serve the built UI and API on port 3000:
 
 ```bash
 npm run build
-npm start
+HOST=127.0.0.1 npm start
 ```
 
 ## Test
@@ -92,9 +107,10 @@ npm test
 | Data      | `data/tp.json`          | `TP_DATA_FILE`            |
 | Workers   | 1                       | `TP_WORKER_THREADS`       |
 | Queue cap | 1000                    | `TP_RUN_QUEUE_CAPACITY`   |
+| Retention | 7 days                  | `TP_RUN_RETENTION_DAYS`   |
 | Adapter   | `TP_ADAPTER_MODULES`    | startup-only registration |
 
-Contracts: `/swagger`, `/openapi.json`. Lists use `{ items, total }` with paired `limit` / `offset`. Errors use `{ code, message }`.
+API documentation is available at `/swagger` and `/openapi.json`. Paginated lists use `{ items, total }` with paired `limit` and `offset`. The Server prunes terminal Batches and their Run artifacts after the retention period.
 
 ## MCP
 
@@ -106,11 +122,10 @@ TP_BASE_URL=http://127.0.0.1:3000 npm run mcp
 
 ## Architecture
 
-- **Server**: catalog, case persistence, and run queue. It does not interpret actors or touch resources.
-- **Worker**: fixed in-process thread pool. One worker executes one run at a time.
-- **Adapter**: typed leaf capabilities. Each run owns its own session, which interprets actors and resource semantics.
-- Cases are `{ main, trees }`. Blackboard bindings are `{ key }` / `{ literal }`.
-- Behavior tree execution follows BT.CPP v4 semantics. Infinite `Repeat` / `RetryUntilSuccessful` use `-1` and stop by cancellation.
-- Active runs (`queued` / `running` / `canceling`) live in memory. `data/tp.json` stores terminal runs only.
-- The web UI polls `GET /api/runs` and `GET /api/workers` every 2 seconds.
-- Packages: `contract` / `log` / `metrics` / `server` / `web` / `adapters/<name>`. Cross-package tests live in `test/`.
+- The Server registers adapter capabilities, stores Cases, Groups and Batches, and queues Runs. Each Worker executes one behavior tree at a time.
+- A Case defines `{ main, trees, sessions }`. Each Run gets its own adapter sessions for the `(adapter, actor)` pairs in its tree. Session ports can reference the Run blackboard.
+- A Group references existing Cases. Starting a Batch from a Group or a list of Cases snapshots the selection and creates one Run for each selected Case.
+- The UI pages through Batches and watches expanded Runs over server-sent events. Cancel a Batch or a single Run from the Runs page.
+- The Server stores data in `data/tp.json`. Active Runs interrupted by a restart finish with an error. The Batch and session APIs supersede the earlier Browser case payload and Run creation endpoint.
+
+To upgrade from the earlier public version, start the new version in a fresh checkout. Keep the earlier checkout’s `data/` directory as an archive of its cases, runs, and artifacts.

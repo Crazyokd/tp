@@ -1,4 +1,4 @@
-export type { CapabilityDefinition, CatalogCapability } from './adapter-contract.ts';
+export type { CapabilityDefinition, CatalogCapability, PortDefinition } from './adapter-contract.ts';
 export * from './artifact.ts';
 export * from './case-catalog.ts';
 export * from './case-document.ts';
@@ -10,5 +10,6 @@ export * from './json-schema.ts';
 export * from './openapi.ts';
 export * from './precondition.ts';
 export * from './run-tree.ts';
+export * from './sessions.ts';
 export * from './tree-document.ts';
 export * from './types.ts';

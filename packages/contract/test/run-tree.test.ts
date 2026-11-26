@@ -7,8 +7,10 @@ import {
   failedRunError,
   finalizeRunTree,
   findRunNode,
+  recordRunProgressEvent,
   stripRunTree,
 } from '../src/run-tree.ts';
+import { sessionsForLeaves } from '../src/sessions.ts';
 import type { CaseDefinition, LeafNode, Run, RunNodeProgressEvent, TreeNode } from '../src/types.ts';
 
 function leaf(capability: string, extra: Partial<LeafNode> = {}): LeafNode {
@@ -23,7 +25,8 @@ function leaf(capability: string, extra: Partial<LeafNode> = {}): LeafNode {
 }
 
 function doc(node: TreeNode, extraTrees: Record<string, TreeNode> = {}): CaseDefinition {
-  return { main: 'Main', trees: { Main: node, ...extraTrees } };
+  const trees = { Main: node, ...extraTrees };
+  return { main: 'Main', trees, sessions: sessionsForLeaves(trees) };
 }
 
 test('createRunTree clones definition shape with pending nodes', () => {
@@ -40,12 +43,15 @@ test('createRunTree clones definition shape with pending nodes', () => {
   assert.equal(tree.trees.Main?.status, 'pending');
   assert.deepEqual(tree.trees.Main?.attempts, []);
   assert.equal(tree.trees.Park?.status, 'pending');
-  assert.deepEqual(stripRunTree(tree), definition);
+  const stripped = stripRunTree(tree);
+  assert.equal(stripped.main, definition.main);
+  assert.deepEqual(stripped.trees, definition.trees);
 });
 
 test('Run type has tree and no treeProgress', () => {
   const run = {
     id: 'r1',
+    batchId: 'batch-1',
     caseId: 'c1',
     status: 'queued',
     createdAt: '2026-09-14T00:00:00.000Z',
@@ -384,6 +390,83 @@ test('apply does not mutate the input snapshot tree', () => {
   assert.deepEqual(findRunNode(snapshot.tree, '').attempts, []);
 });
 
+test('owned progress touches only its target and isolates recorded output', () => {
+  const snapshot = {
+    revision: 0,
+    tree: createRunTree(doc({ type: 'Sequence', children: [leaf('go'), leaf('unused')] })),
+  };
+  Object.defineProperty(findRunNode(snapshot.tree, 'children.1'), 'ports', {
+    enumerable: true,
+    get: () => assert.fail('progress must not traverse an unrelated branch'),
+  });
+  recordRunProgressEvent(snapshot, {
+    revision: 1,
+    kind: 'started',
+    path: 'children.0',
+    nodeType: 'Action',
+    attempt: 1,
+    timestamp: '2026-09-14T00:00:01.000Z',
+    capability: 'go',
+    actor: 'robot',
+  });
+  const output = { nested: { value: 1 } };
+  recordRunProgressEvent(snapshot, {
+    revision: 2,
+    kind: 'finished',
+    path: 'children.0',
+    nodeType: 'Action',
+    attempt: 1,
+    timestamp: '2026-09-14T00:00:02.000Z',
+    status: 'passed',
+    output,
+  });
+  output.nested.value = 2;
+  assert.equal(snapshot.revision, 2);
+  assert.deepEqual(findRunNode(snapshot.tree, 'children.0').attempts[0]?.output, { nested: { value: 1 } });
+  assert.equal(findRunNode(snapshot.tree, 'children.1').status, 'pending');
+});
+
+test('owned progress rejects invalid events and uncloneable output without partial updates', () => {
+  const snapshot = { revision: 0, tree: createRunTree(doc(leaf('go'))) };
+  const started = {
+    revision: 1,
+    kind: 'started' as const,
+    path: '',
+    nodeType: 'Action' as const,
+    attempt: 1,
+    timestamp: '2026-09-14T00:00:01.000Z',
+    capability: 'go',
+    actor: 'robot',
+  };
+  for (const extra of [{ revision: 2 }, { actor: 'other' }, { attempt: 2 }, { path: 'unknown' }]) {
+    const before = structuredClone(snapshot);
+    assert.throws(() => recordRunProgressEvent(snapshot, { ...started, ...extra }));
+    assert.deepEqual(snapshot, before);
+  }
+  recordRunProgressEvent(snapshot, started);
+  const finished = {
+    revision: 2,
+    kind: 'finished' as const,
+    path: '',
+    nodeType: 'Action' as const,
+    attempt: 1,
+    timestamp: '2026-09-14T00:00:02.000Z',
+    status: 'passed' as const,
+  };
+  for (const extra of [
+    { revision: 1 },
+    { attempt: 2 },
+    { timestamp: '2026-09-14T00:00:00.000Z' },
+    { error: ' ' },
+    { output: { invalid: undefined } },
+    { output: new Proxy({ value: 'ok' }, {}) },
+  ]) {
+    const before = structuredClone(snapshot);
+    assert.throws(() => recordRunProgressEvent(snapshot, { ...finished, ...extra } as RunNodeProgressEvent));
+    assert.deepEqual(snapshot, before);
+  }
+});
+
 test('apply rejects non-ISO timestamp', () => {
   const snapshot = { revision: 0, tree: createRunTree(doc(leaf('go'))) };
   assert.throws(() =>
@@ -399,3 +482,63 @@ test('apply rejects non-ISO timestamp', () => {
     }),
   );
 });
+
+for (const apply of [
+  applyRunProgressEvent,
+  (snapshot, event) => {
+    recordRunProgressEvent(snapshot, event);
+    return snapshot;
+  },
+])
+  test('attempts retention caps stored records but keeps attempt numbering', async () => {
+    const { MAX_STORED_RUN_ATTEMPTS } = await import('../src/run-tree.ts');
+    const definition = doc({
+      type: 'RetryUntilSuccessful',
+      num_attempts: -1,
+      child: leaf('wait', { type: 'Condition' }),
+    });
+    let snapshot = { revision: 0, tree: createRunTree(definition) };
+    const total = MAX_STORED_RUN_ATTEMPTS + 25;
+    const at = (attempt: number, ms: number) =>
+      new Date(Date.parse('2026-09-14T00:00:00.000Z') + attempt * 1000 + ms).toISOString();
+    for (let attempt = 1; attempt <= total; attempt += 1) {
+      const started: RunNodeProgressEvent = {
+        revision: snapshot.revision + 1,
+        kind: 'started',
+        path: 'child',
+        nodeType: 'Condition',
+        attempt,
+        timestamp: at(attempt, 0),
+        capability: 'wait',
+        actor: 'robot',
+      };
+      snapshot = apply(snapshot, started);
+      snapshot = apply(snapshot, {
+        revision: snapshot.revision + 1,
+        kind: 'finished',
+        path: 'child',
+        nodeType: 'Condition',
+        attempt,
+        timestamp: at(attempt, 500),
+        status: 'failed',
+        error: `not ready ${attempt}`,
+      });
+    }
+    const node = findRunNode(snapshot.tree, 'child');
+    assert.equal(node.attempts.length, MAX_STORED_RUN_ATTEMPTS);
+    assert.equal(node.attempts.at(-1)?.attempt, total);
+    assert.equal(node.attempts.at(-1)?.error, `not ready ${total}`);
+    assert.equal(node.attempts[0]?.attempt, total - MAX_STORED_RUN_ATTEMPTS + 1);
+    // 截断后下一次 started 仍按末条编号 +1 校验通过。
+    snapshot = apply(snapshot, {
+      revision: snapshot.revision + 1,
+      kind: 'started',
+      path: 'child',
+      nodeType: 'Condition',
+      attempt: total + 1,
+      timestamp: at(total + 1, 0),
+      capability: 'wait',
+      actor: 'robot',
+    });
+    assert.equal(findRunNode(snapshot.tree, 'child').attempts.at(-1)?.attempt, total + 1);
+  });

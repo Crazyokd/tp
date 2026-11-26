@@ -15,8 +15,11 @@ test('every public resource is registered once', () => {
     'PUT /api/cases/:id',
     'DELETE /api/cases/:id',
     'GET /api/runs',
-    'POST /api/runs',
-    'GET /api/runs/:id',
+    'GET /api/batches',
+    'POST /api/batches',
+    'GET /api/batches/:id',
+    'POST /api/batches/:id/cancel',
+    'GET /api/runs/:id/events',
     'GET /api/runs/:id/artifacts/:artifactId',
     'POST /api/runs/:id/cancel',
     'GET /api/workers',
@@ -45,6 +48,20 @@ test('openapi lists the same operations', () => {
   );
 });
 
+test('published Batch creation schema requires exactly one selector and unique Case ids', () => {
+  const document = generateOpenApi();
+  const operation = document.paths['/api/batches']!.post as {
+    requestBody: {
+      content: {
+        'application/json': { schema: { oneOf?: unknown; properties: { caseIds: { uniqueItems?: boolean } } } };
+      };
+    };
+  };
+  const schema = operation.requestBody.content['application/json'].schema;
+  assert.deepEqual(schema.oneOf, [{ required: ['caseIds'] }, { required: ['groupId'] }]);
+  assert.equal(schema.properties.caseIds.uniqueItems, true);
+});
+
 test('openapi documents getRunArtifact as octet-stream', () => {
   const doc = generateOpenApi();
   const operation = doc.paths['/api/runs/{id}/artifacts/{artifactId}']?.get as
@@ -54,11 +71,29 @@ test('openapi documents getRunArtifact as octet-stream', () => {
   assert.notEqual(success?.description, 'No Content');
 });
 
+test('openapi documents watchRun as event-stream and does not register getRun', () => {
+  const doc = generateOpenApi();
+  assert.equal(
+    operations.some((item) => item.id === 'getRun'),
+    false,
+  );
+  const operation = doc.paths['/api/runs/{id}/events']?.get as
+    | {
+        operationId?: string;
+        parameters?: { name: string; in: string }[];
+        responses?: Record<string, { content?: Record<string, unknown> }>;
+      }
+    | undefined;
+  assert.equal(operation?.operationId, 'watchRun');
+  assert.ok(operation?.responses?.['200']?.content?.['text/event-stream']);
+  assert.ok(operation?.parameters?.some((item) => item.name === 'Last-Event-ID' && item.in === 'header'));
+});
+
 test('openapi groups operations by resource tag', () => {
   const doc = generateOpenApi();
   assert.deepEqual(
     doc.tags.map((tag) => tag.name),
-    ['Adapters', 'Cases', 'Runs', 'Workers', 'Ops'],
+    ['Adapters', 'Cases', 'Groups', 'Runs', 'Batches', 'Workers', 'Ops'],
   );
   assert.deepEqual(operationTags(doc, '/api/adapters', 'get'), ['Adapters']);
   assert.deepEqual(operationTags(doc, '/api/cases', 'post'), ['Cases']);
@@ -80,6 +115,8 @@ function operationTags(doc: ReturnType<typeof generateOpenApi>, path: string, me
 function expectedTag(path: string): string {
   if (path.startsWith('/api/adapters')) return 'Adapters';
   if (path.startsWith('/api/cases')) return 'Cases';
+  if (path.startsWith('/api/groups')) return 'Groups';
+  if (path.startsWith('/api/batches')) return 'Batches';
   if (path.startsWith('/api/runs')) return 'Runs';
   if (path.startsWith('/api/workers')) return 'Workers';
   if (path.startsWith('/api/metrics')) return 'Ops';

@@ -1,8 +1,9 @@
 import { Play, Plus, Save, Trash2 } from 'lucide-react';
 import { type DragEvent, type FormEvent, useState } from 'react';
 
-import type { CatalogCapability } from '@tp/contract';
-import type { CaseDefinition, LeafNode, NodeType, PortBinding, TreeNode } from '@tp/contract';
+import type { CatalogCapability, PortDefinition } from '@tp/contract';
+import type { CaseDefinition, LeafNode, NodeType, PortBinding, SessionBinding, TreeNode } from '@tp/contract';
+import type { HttpAdapter } from '../api/client.ts';
 import {
   canMove,
   LEAF_TYPES,
@@ -65,6 +66,8 @@ const NODE_HINTS: Record<NodeType, string> = {
 
 type Props = {
   caseName: string;
+  caseDescription: string;
+  adapters: readonly HttpAdapter[];
   capabilities: readonly CatalogCapability[];
   definition: CaseDefinition;
   definitionText: string;
@@ -73,6 +76,7 @@ type Props = {
   status: string;
   onAddNode: (input: NodeInput, path?: string, mode?: DropMode) => void;
   onCaseNameChange: (name: string) => void;
+  onCaseDescriptionChange: (description: string) => void;
   onCreate: () => void;
   onDeleteNode: () => void;
   onMoveNode: (delta: -1 | 1) => void;
@@ -90,10 +94,13 @@ type Props = {
   onUpdateVariable?: (value: string) => void;
   onUpdateSwitchCase?: (index: number, value: string) => void;
   onRemoveSwitchCase?: (index: number) => void;
+  onUpdateSessions: (sessions: SessionBinding[]) => void;
 };
 
 export function BuilderPage({
   caseName,
+  caseDescription,
+  adapters,
   capabilities,
   definition,
   definitionText,
@@ -102,6 +109,7 @@ export function BuilderPage({
   status,
   onAddNode,
   onCaseNameChange,
+  onCaseDescriptionChange,
   onCreate,
   onDeleteNode,
   onMoveNode,
@@ -114,8 +122,10 @@ export function BuilderPage({
   onUpdateVariable,
   onUpdateSwitchCase,
   onRemoveSwitchCase,
+  onUpdateSessions,
 }: Props) {
   const [centerView, setCenterView] = useState<'canvas' | 'json'>('canvas');
+  const [selectedSession, setSelectedSession] = useState(0);
 
   return (
     <section className="editor" data-testid="builder-page">
@@ -137,6 +147,17 @@ export function BuilderPage({
             required
             value={caseName}
             onChange={(event) => onCaseNameChange(event.target.value)}
+          />
+        </label>
+        <label>
+          描述
+          <input
+            data-testid="case-description"
+            name="description"
+            autoComplete="off"
+            required
+            value={caseDescription}
+            onChange={(event) => onCaseDescriptionChange(event.target.value)}
           />
         </label>
         <div className="toolbar form-actions">
@@ -396,9 +417,138 @@ export function BuilderPage({
               下移
             </button>
           </div>
+          <SessionsPanel
+            adapters={adapters}
+            selectedIndex={selectedSession}
+            sessions={definition.sessions}
+            onSelect={setSelectedSession}
+            onUpdate={onUpdateSessions}
+          />
         </aside>
       </div>
     </section>
+  );
+}
+
+function SessionsPanel({
+  adapters,
+  selectedIndex,
+  sessions,
+  onSelect,
+  onUpdate,
+}: {
+  adapters: readonly HttpAdapter[];
+  selectedIndex: number;
+  sessions: SessionBinding[];
+  onSelect: (index: number) => void;
+  onUpdate: (sessions: SessionBinding[]) => void;
+}) {
+  const grouped = new Map<string, Array<{ row: SessionBinding; index: number }>>();
+  for (const [index, row] of sessions.entries()) {
+    const list = grouped.get(row.adapter) ?? [];
+    list.push({ row, index });
+    grouped.set(row.adapter, list);
+  }
+  const currentIndex = sessions.length === 0 ? -1 : Math.min(selectedIndex, sessions.length - 1);
+  const current = currentIndex >= 0 ? sessions[currentIndex] : undefined;
+  const adapter = adapters.find((item) => item.id === current?.adapter);
+  const ports = adapter?.session?.ports ?? [];
+
+  function updatePorts(ports: SessionBinding['ports']) {
+    if (currentIndex < 0) return;
+    onUpdate(sessions.map((row, rowIndex) => (rowIndex === currentIndex ? { ...row, ports } : row)));
+  }
+
+  return (
+    <div className="sessions-panel" data-testid="sessions-panel">
+      <h3>Sessions</h3>
+      <p className="meta">由叶子上的 adapter / actor 自动算出。Session 输入口可接字面量或本 Run 的黑板键。</p>
+      {sessions.length === 0 ? <p className="meta">树上还没有填了 actor 的叶子。</p> : null}
+      {[...grouped.entries()].map(([adapterId, rows]) => (
+        <div className="session-group" key={adapterId}>
+          <div className="palette-title">{adapterId}</div>
+          {rows.map(({ row, index }) => (
+            <button
+              className={index === currentIndex ? 'session-row selected' : 'session-row'}
+              data-testid={`session-row-${index}`}
+              key={`${row.adapter}/${row.actor}/${index}`}
+              type="button"
+              onClick={() => onSelect(index)}
+            >
+              {row.actor || '(未填 actor)'}
+            </button>
+          ))}
+        </div>
+      ))}
+      {current ? (
+        <>
+          <p className="meta" data-testid="session-identity">
+            {current.adapter} / {current.actor || '(未填 actor)'}
+          </p>
+          {ports.length === 0 ? <p className="meta">该 Adapter 没有 Session 口。</p> : null}
+          {ports.map((port) => (
+            <SessionPortField
+              key={port.name}
+              binding={current.ports?.[port.name]}
+              port={port}
+              onChange={(binding) => {
+                const next = { ...current.ports };
+                if (!binding) delete next[port.name];
+                else next[port.name] = binding;
+                updatePorts(next);
+              }}
+            />
+          ))}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function SessionPortField({
+  binding,
+  port,
+  onChange,
+}: {
+  binding: PortBinding | undefined;
+  port: PortDefinition;
+  onChange: (binding: PortBinding | undefined) => void;
+}) {
+  const mode = binding && 'key' in binding ? 'key' : 'literal';
+  return (
+    <fieldset className="port-field">
+      <legend>
+        {port.name} (in
+        {port.required === false ? '' : ', required'})
+      </legend>
+      <label>
+        接线
+        <select
+          data-testid={`session-port-mode-${port.name}`}
+          value={mode}
+          onChange={(event) =>
+            onChange(
+              event.target.value === 'key'
+                ? { key: binding && 'key' in binding ? binding.key : '' }
+                : { literal: binding && 'literal' in binding ? binding.literal : '' },
+            )
+          }
+        >
+          <option value="literal">字面量</option>
+          <option value="key">黑板键</option>
+        </select>
+      </label>
+      <label>
+        {mode === 'key' ? '黑板键' : '字面量'}
+        <input
+          data-testid={`session-port-${port.name}`}
+          value={binding ? ('key' in binding ? binding.key : literalText(binding.literal)) : ''}
+          onChange={(event) =>
+            onChange(mode === 'key' ? { key: event.target.value } : { literal: parseLiteral(event.target.value) })
+          }
+        />
+      </label>
+    </fieldset>
   );
 }
 

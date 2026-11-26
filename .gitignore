@@ -11,3 +11,4 @@ docs/superpowers/plans/
 docs/archify/*.html
 docs/archify/*.png
 docs/archify/*.visual-check.*
+__pycache__/
