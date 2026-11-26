@@ -41,9 +41,19 @@ test('platform and queue record case run and depth on one registry', async () =>
   const runQueue = createRunQueue({ metrics });
   const platform = await createPlatform(join(dir, 'db.json'), { registry, runQueue, metrics });
   try {
-    const created = await platform.createCase({ name: 'counted', definition: passDefinition() });
-    await platform.updateCase(created.id, { name: 'counted', definition: passDefinition() });
-    const run = await platform.createRun({ caseId: created.id });
+    const created = await platform.createCase({
+      name: 'counted',
+      description: 'counted',
+
+      definition: passDefinition(),
+    });
+    await platform.updateCase(created.id, {
+      name: 'counted',
+      description: 'counted',
+
+      definition: passDefinition(),
+    });
+    const [run] = (await platform.createBatch({ trigger: { kind: 'web' }, caseIds: [created.id] })).runs;
     assert.equal(seriesValue(metrics.collect(), 'cases_total', { action: 'created' }), 1);
     assert.equal(seriesValue(metrics.collect(), 'cases_total', { action: 'updated' }), 1);
     assert.equal(seriesValue(metrics.collect(), 'run_queue_depth'), 1);
@@ -61,6 +71,7 @@ test('platform and queue record case run and depth on one registry', async () =>
     const tight = createRunQueue({ capacity: 1, metrics });
     tight.enqueue({
       id: 'kept',
+      batchId: 'batch-kept',
       caseId: created.id,
       status: 'queued',
       createdAt: new Date().toISOString(),
@@ -74,6 +85,7 @@ test('platform and queue record case run and depth on one registry', async () =>
     assert.throws(() =>
       tight.enqueue({
         id: 'overflow',
+        batchId: 'batch-overflow',
         caseId: created.id,
         status: 'queued',
         createdAt: new Date().toISOString(),
@@ -104,9 +116,12 @@ test('HTTP API returns process metrics after a finished run', async () => {
     const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
     const created = await jsonFetch(`${base}/api/cases`, {
       method: 'POST',
-      body: { name: 'scraped', definition: passDefinition() },
+      body: { name: 'scraped', description: 'scraped', definition: passDefinition() },
     });
-    await jsonFetch(`${base}/api/runs`, { method: 'POST', body: { caseId: created.id } });
+    await jsonFetch(`${base}/api/batches`, {
+      method: 'POST',
+      body: { trigger: { kind: 'web' }, caseIds: [created.id] },
+    });
     await waitForFinished(base, 1);
     await errorFetch(`${base}/api/cases/missing`);
 
@@ -122,7 +137,7 @@ test('HTTP API returns process metrics after a finished run', async () => {
     assert.equal(seriesValue(body.instruments, 'cases_total', { action: 'created' }), 1);
     assert.equal(seriesValue(body.instruments, 'runs_total', { status: 'passed' }), 1);
     assert.equal(seriesValue(body.instruments, 'http_requests_total', { operation: 'createCase', code: '201' }), 1);
-    assert.equal(seriesValue(body.instruments, 'http_requests_total', { operation: 'createRun', code: '201' }), 1);
+    assert.equal(seriesValue(body.instruments, 'http_requests_total', { operation: 'createBatch', code: '201' }), 1);
     assert.equal(seriesValue(body.instruments, 'http_requests_total', { operation: 'getCase', code: '404' }), 1);
     assert.ok(
       body.instruments.some(

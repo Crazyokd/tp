@@ -129,15 +129,31 @@ export type TreeNode =
   | SwitchNode
   | SubTreeNode;
 
+export type SessionBinding = {
+  adapter: string;
+  actor: string;
+  ports?: Record<string, PortBinding>;
+};
+
 export type CaseDefinition = {
   main: string;
   trees: Record<string, TreeNode>;
+  sessions: SessionBinding[];
 };
 
 export type TestCase = {
   id: string;
   name: string;
+  description: string;
   definition: CaseDefinition;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type TestGroup = {
+  id: string;
+  name: string;
+  caseIds: string[];
   createdAt: string;
   updatedAt: string;
 };
@@ -291,6 +307,7 @@ export type Artifact = {
 
 export type Run = {
   id: string;
+  batchId: string;
   caseId: string;
   status: RunStatus;
   createdAt: string;
@@ -305,7 +322,33 @@ export type Run = {
   error?: string;
 };
 
-export type LiveRun = Run & { definition: CaseDefinition };
+export type LiveRun = Run & {
+  definition: CaseDefinition;
+  blackboard?: Record<string, unknown>;
+};
+
+export type BatchStatus = 'queued' | 'running' | 'passed' | 'failed' | 'canceled';
+
+export type BatchTrigger = { kind: 'web' } | { kind: 'mcp' } | { kind: 'ci'; pipelineUrl?: string };
+
+export type BatchSelection = { kind: 'cases' } | { kind: 'group'; groupId: string; groupName: string };
+
+export type BatchMetadata = {
+  name: string;
+  description: string;
+  trigger: BatchTrigger;
+  selection: BatchSelection;
+};
+
+export type Batch = BatchMetadata & {
+  id: string;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  status: BatchStatus;
+  counts: Record<RunStatus, number>;
+  runs: Run[];
+};
 
 export type WorkerSlotState = 'starting' | 'idle' | 'running' | 'finalizing' | 'failed';
 

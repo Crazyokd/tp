@@ -14,8 +14,8 @@ test('product code uses a typed React Flow stack', async () => {
   assert.ok(pkg.devDependencies.typescript);
   assert.match(pkg.scripts.typecheck, /workspaces/);
   assert.match(pkg.scripts.build, /@tp\/web/);
-  assert.match(pkg.scripts.server, /@tp\/adapter-browser/);
   assert.ok(pkg.workspaces.includes('packages/adapters/*'));
+  assert.match(pkg.scripts.server, /@tp\/adapter-browser/);
   assert.equal(pkg.scripts.worker, undefined);
   assert.equal(pkg.scripts.adapter, undefined);
 

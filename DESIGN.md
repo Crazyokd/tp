@@ -125,7 +125,7 @@ components:
 
 ## Overview
 
-密集运维台，不是营销站。`packages/web/`：顶栏 + 四个 hash 路由（Runs / Cases / Builder / Workers）。冷色画布上霜玻璃卡片，树画布 + 等宽时间戳。样式只写 `packages/web/src/styles.css`。图册：`packages/web/public/architecture-atlas/index.html`。
+密集运维台，不是营销站。`packages/web/`：顶栏 + 五个 hash 路由（Runs / Cases / Groups / Builder / Workers）。冷色画布上霜玻璃卡片，树画布 + 等宽时间戳。样式只写 `packages/web/src/styles.css`。图册：`packages/web/public/architecture-atlas/index.html`。
 
 状态文案中文（排队中 / 执行中 / 已通过 / 失败 / 已取消）。路由名、节点类型、capability、路径、ID 保持 ASCII。图标 Lucide。
 
@@ -153,11 +153,12 @@ Token 对齐 `styles.css` 的 `:root`。功能色就这几条，不要另发明�
 
 ## Layout
 
-顶栏 + 居中列 `max-width: 1540px`，页边 16（窄于 760px 为 8）。无侧栏。
+顶栏 + 居中列 `max-width: 1540px`，页边 16（窄于 760px 为 8）。无全局侧栏。
 
 - Header：品牌、居中导航、刷新；窄屏堆叠。
 - Runs：通栏卡片；展开 = 树画布 + 260–330px 详情。
 - Cases / Workers：`auto-fill`，`minmax(280px, 1fr)`，12px 缝。
+- Groups：`254px | 1fr` 的分组列表与成员详情；新建或编辑时才显示可搜索的成员表单。760px 以下用下拉选择分组，详情单列。
 - Builder：`240px | 1fr | 330px`；1180px 以下单列。
 - 树节点固定 240×144。Run 画布高 560（窄屏 440）。
 
@@ -184,3 +185,9 @@ Token 对齐 `styles.css` 的 `:root`。功能色就这几条，不要另发明�
 - 尊重 `prefers-reduced-motion`；动效短，不要弹簧。
 - 用户状态中文，代码 ASCII。不要给「停止 / 已通过」发明英文壳。
 - 样式不要指向 `frontend/` 或 Vue。应用在 `packages/web/`。
+
+## Groups
+
+默认展示当前分组的成员名称和描述，用平直行与分隔线组织内容。分组列表保持紧凑，空白新建表单不占首屏。操作集中在详情标题旁：编辑、删除、运行；编辑态只显示取消和保存。成员选择可按名称或描述搜索，未显示的已选成员保留。
+
+编辑期间先保存或取消再切换分组；异步操作给出按钮状态，失败保留草稿并显示原因。进入编辑聚焦组名，退出或完成操作后恢复到可用控件。计数使用等宽数字，颜色、字号、圆角沿用现有 token，不增加嵌套卡片或弹窗。

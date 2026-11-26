@@ -9,6 +9,7 @@ import {
   makeNode,
   nodeInputFromTypeSelect,
   replaceNodeType,
+  syncCaseSessions,
   typeSelectValue,
   updateWrapper,
 } from '../src/domain/behavior-tree.ts';
@@ -20,7 +21,7 @@ import {
 } from '../src/features/BehaviorTreeGraph.tsx';
 
 function treeDoc(tree: TreeNode): CaseDefinition {
-  return { main: 'Main', trees: { Main: tree } };
+  return { main: 'Main', trees: { Main: tree }, sessions: [] };
 }
 
 const graphDefinition: CaseDefinition = {
@@ -38,6 +39,7 @@ const graphDefinition: CaseDefinition = {
       ],
     },
   },
+  sessions: [{ adapter: 'test', actor: 'robot', ports: {} }],
 };
 
 test('shared graph layout is structurally identical in edit and run modes', () => {
@@ -362,6 +364,23 @@ test('type select can encode a catalog capability and replace a control node wit
     capability: 'demo.mapping.start',
     ports: {},
   });
+});
+
+test('syncCaseSessions keeps ports for existing leaf pairs and drops extras', () => {
+  const next = syncCaseSessions({
+    main: 'Main',
+    trees: {
+      Main: {
+        type: 'Sequence',
+        children: [{ type: 'Action', adapter: 'demo', actor: 'robot', capability: 'demo.system.ready', ports: {} }],
+      },
+    },
+    sessions: [
+      { adapter: 'demo', actor: 'robot', ports: { container: { literal: 'demo-dev' } } },
+      { adapter: 'browser', actor: 'tab', ports: {} },
+    ],
+  });
+  assert.deepEqual(next.sessions, [{ adapter: 'demo', actor: 'robot', ports: { container: { literal: 'demo-dev' } } }]);
 });
 
 test('type select rejects an unknown adapter capability', () => {

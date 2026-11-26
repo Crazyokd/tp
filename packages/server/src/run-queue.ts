@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 
 import {
   appendRunArtifact,
-  applyRunProgressEvent,
+  recordRunProgressEvent,
   type LiveRun,
   type RunArtifactEvent,
   type RunNodeProgressEvent,
@@ -23,7 +23,26 @@ export function createRunQueue(options: { capacity?: number; metrics?: ServerMet
     metrics.queueDepth.set(runs.length);
   }
 
+  function recordProgress(id: string, event: RunNodeProgressEvent): LiveRun {
+    const run = runs.find((candidate) => candidate.id === id);
+    if (!run) throw new Error(`active run ${id} not found`);
+    if (run.status !== 'running' && run.status !== 'canceling') {
+      throw new Error(`active run ${id} is not running`);
+    }
+    recordRunProgressEvent(run, event);
+    return run;
+  }
+
   return {
+    reserve(count: number): void {
+      if (!Number.isInteger(count) || count < 1) throw new Error('run reserve count must be a positive integer');
+      if (runs.length + count > capacity) {
+        log.error('queue full', count, capacity);
+        metrics.queueRejected.inc();
+        throw new Error(`run queue capacity ${capacity} exceeded`);
+      }
+    },
+
     enqueue(input: LiveRun): LiveRun {
       if (input.status !== 'queued') throw new Error('new run must be queued');
       if (runs.some((run) => run.id === input.id)) throw new Error(`run ${input.id} is already active`);
@@ -50,15 +69,11 @@ export function createRunQueue(options: { capacity?: number; metrics?: ServerMet
     },
 
     applyProgress(id: string, event: RunNodeProgressEvent): LiveRun {
-      const run = runs.find((candidate) => candidate.id === id);
-      if (!run) throw new Error(`active run ${id} not found`);
-      if (run.status !== 'running' && run.status !== 'canceling') {
-        throw new Error(`active run ${id} is not running`);
-      }
-      const next = applyRunProgressEvent({ revision: run.revision, tree: run.tree }, event);
-      run.revision = next.revision;
-      run.tree = next.tree;
-      return clone(run);
+      return clone(recordProgress(id, event));
+    },
+
+    recordProgress(id: string, event: RunNodeProgressEvent): void {
+      recordProgress(id, event);
     },
 
     applyArtifact(id: string, event: RunArtifactEvent): LiveRun {
@@ -100,8 +115,12 @@ export function createRunQueue(options: { capacity?: number; metrics?: ServerMet
       return clone(run);
     },
 
-    list(): LiveRun[] {
-      return runs.map(clone);
+    statuses(): Pick<LiveRun, 'id' | 'status'>[] {
+      return runs.map(({ id, status }) => ({ id, status }));
+    },
+
+    list(ids?: ReadonlySet<string>): LiveRun[] {
+      return runs.filter((run) => !ids || ids.has(run.id)).map(clone);
     },
 
     get(id: string): LiveRun {

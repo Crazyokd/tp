@@ -1,5 +1,5 @@
 import { validateCaseDocument } from './case-document.ts';
-import { isJsonValue } from './json-schema.ts';
+import { isJsonValue } from './json-value.ts';
 import type {
   CaseDefinition,
   JsonObject,
@@ -12,6 +12,11 @@ import type {
 } from './types.ts';
 
 const PENDING: { status: RunNodeStatus; attempts: [] } = { status: 'pending', attempts: [] };
+
+// 单节点留存的 attempt 记录上限。RetryUntilSuccessful -1 下轮询型 Condition 的
+// attempts 会无限增长，拖慢快照复制和校验并耗尽内存。只保留最近若干次；
+// 失败排查仍能读取末次 attempt.error，attempt 编号保持单调递增。
+export const MAX_STORED_RUN_ATTEMPTS = 200;
 
 export type RunTree = { main: string; trees: Record<string, RunNode> };
 
@@ -27,6 +32,7 @@ export function stripRunTree(tree: RunTree): CaseDefinition {
   return {
     main: tree.main,
     trees: Object.fromEntries(Object.entries(tree.trees).map(([id, node]) => [id, stripNode(node)])),
+    sessions: [],
   };
 }
 
@@ -73,6 +79,13 @@ export type RunTreeSnapshot = { revision: number; tree: RunTree };
 const FINISHED_NODE_STATUSES = new Set(['passed', 'failed', 'canceled', 'skipped']);
 
 export function applyRunProgressEvent(snapshot: RunTreeSnapshot, event: RunNodeProgressEvent): RunTreeSnapshot {
+  const next = { revision: snapshot.revision, tree: structuredClone(snapshot.tree) };
+  recordRunProgressEvent(next, event);
+  return next;
+}
+
+// The caller must exclusively own the snapshot and its tree.
+export function recordRunProgressEvent(snapshot: RunTreeSnapshot, event: RunNodeProgressEvent): void {
   const expectedRevision = snapshot.revision + 1;
   if (!Number.isInteger(event.revision) || event.revision !== expectedRevision) {
     throw new Error(`expected revision ${expectedRevision}, received ${event.revision}`);
@@ -84,7 +97,7 @@ export function applyRunProgressEvent(snapshot: RunTreeSnapshot, event: RunNodeP
     throw new Error('progress attempt must be a positive integer');
   }
 
-  const tree = structuredClone(snapshot.tree);
+  const tree = snapshot.tree;
   const node = findRunNode(tree, event.path);
   if (event.nodeType !== node.type) {
     throw new Error(`progress node type ${event.nodeType} does not match ${node.type}`);
@@ -93,8 +106,12 @@ export function applyRunProgressEvent(snapshot: RunTreeSnapshot, event: RunNodeP
   if (event.kind === 'started') {
     validateStartedMetadata(node, event);
     validateStartAttempt(node, event.path, event.attempt, event.timestamp, maxAttemptsAt(tree, event.path));
+    const retained =
+      node.attempts.length >= MAX_STORED_RUN_ATTEMPTS
+        ? node.attempts.slice(-(MAX_STORED_RUN_ATTEMPTS - 1))
+        : node.attempts;
     node.attempts = [
-      ...node.attempts,
+      ...retained,
       {
         attempt: event.attempt,
         status: 'running',
@@ -103,19 +120,20 @@ export function applyRunProgressEvent(snapshot: RunTreeSnapshot, event: RunNodeP
       },
     ];
     node.status = 'running';
-    return { revision: event.revision, tree };
+    snapshot.revision = event.revision;
+    return;
   }
 
   validateFinishedEvent(event);
   validateFinishAttempt(node, event.path, event.attempt, event.timestamp);
   const attempt = { ...node.attempts.at(-1)! };
-  node.attempts = [...node.attempts.slice(0, -1), attempt];
   attempt.status = event.status;
   attempt.finishedAt = event.timestamp;
   if (event.output !== undefined) attempt.output = structuredClone(event.output);
   if (event.error !== undefined) attempt.error = event.error;
+  node.attempts = [...node.attempts.slice(0, -1), attempt];
   node.status = event.status;
-  return { revision: event.revision, tree };
+  snapshot.revision = event.revision;
 }
 
 export function finalizeRunTree(snapshot: RunTreeSnapshot, status: RunStatus, error?: string): RunTreeSnapshot {
@@ -238,6 +256,8 @@ function maxAttemptsAt(tree: RunTree, path: string): number {
       const raw = parts[i + 1];
       i += 1;
       const index = Number.parseInt(raw!, 10);
+      if (current?.type === 'ReactiveSequence' || current?.type === 'ReactiveFallback')
+        maxAttempts = Number.MAX_SAFE_INTEGER;
       current = current && 'children' in current ? current.children[index] : undefined;
       continue;
     }
@@ -262,7 +282,7 @@ function maxAttemptsAt(tree: RunTree, path: string): number {
 }
 
 function multiplyAttemptLimit(ancestorLimit: number, retryLimit: number): number {
-  if (retryLimit === -1) return Number.MAX_SAFE_INTEGER;
+  if (retryLimit === -1 || ancestorLimit === Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER;
   if (!Number.isSafeInteger(retryLimit) || retryLimit < 1) {
     throw new Error('RetryUntilSuccessful num_attempts must be -1 or a positive safe integer');
   }
@@ -296,7 +316,8 @@ function validateStartAttempt(
     if (latest.attempt === attempt) throw new Error(`attempt ${attempt} already started`);
     throw new Error(`attempt ${latest.attempt} is still running`);
   }
-  const expectedAttempt = node.attempts.length + 1;
+  // attempts 只保留最近 MAX_STORED_RUN_ATTEMPTS 条，编号以末条为准而非数组长度。
+  const expectedAttempt = latest ? latest.attempt + 1 : 1;
   if (attempt !== expectedAttempt) {
     throw new Error(`expected attempt ${expectedAttempt}, received ${attempt}`);
   }

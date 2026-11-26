@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Browser Session Isolation</title>
+  </head>
+  <body>
+    <p id="cookie"></p>
+    <p id="local"></p>
+    <p id="session"></p>
+    <p id="api"></p>
+    <button id="write" type="button">write</button>
+    <button id="read" type="button">read</button>
+    <button id="fetch" type="button">fetch</button>
+    <script>
+      const mark = new URLSearchParams(location.search).get('mark') || '';
+      document.getElementById('write').addEventListener('click', () => {
+        document.cookie = `mark=${mark}; path=/`;
+        localStorage.setItem('mark', mark);
+        sessionStorage.setItem('mark', mark);
+      });
+      document.getElementById('read').addEventListener('click', () => {
+        document.getElementById('cookie').textContent = document.cookie || 'empty';
+        document.getElementById('local').textContent = localStorage.getItem('mark') || 'empty';
+        document.getElementById('session').textContent = sessionStorage.getItem('mark') || 'empty';
+      });
+      document.getElementById('fetch').addEventListener('click', async () => {
+        const response = await fetch('/api/mark');
+        document.getElementById('api').textContent = `${response.status}:${await response.text()}`;
+      });
+    </script>
+  </body>
+</html>

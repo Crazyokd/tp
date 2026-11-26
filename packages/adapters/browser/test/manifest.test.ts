@@ -7,14 +7,25 @@ import type { JsonObject } from '@tp/contract';
 import { manifest } from '../src/index.ts';
 
 const capabilityKeys = [
+  'browser.watch_requests',
+  'browser.expect_requests',
   'browser.goto',
   'browser.click',
   'browser.fill',
   'browser.expect_text',
   'browser.screenshot',
+  'browser.canvas_probe',
+  'browser.expect',
+  'browser.expect_url',
+  'browser.reload',
+  'browser.mouse',
+  'browser.touch_drag',
+  'browser.route',
+  'browser.unroute',
+  'browser.release',
 ] as const;
 
-test('browser manifest registers five typed capabilities', () => {
+test('browser manifest registers typed capabilities and session ports', () => {
   assert.equal(JSON.stringify(manifest).includes('inputSchema'), false);
   assert.equal(JSON.stringify(manifest).includes('outputSchema'), false);
   assert.deepEqual(adapterManifestSchema.parse(manifest), manifest);
@@ -25,13 +36,33 @@ test('browser manifest registers five typed capabilities', () => {
     [...capabilityKeys],
   );
   assert.deepEqual(Object.fromEntries(manifest.capabilities.map(({ key, kind }) => [key, kind])), {
+    'browser.watch_requests': 'Action',
+    'browser.expect_requests': 'Condition',
     'browser.goto': 'Action',
     'browser.click': 'Action',
     'browser.fill': 'Action',
     'browser.expect_text': 'Condition',
     'browser.screenshot': 'Action',
+    'browser.canvas_probe': 'Condition',
+    'browser.expect': 'Condition',
+    'browser.expect_url': 'Condition',
+    'browser.reload': 'Action',
+    'browser.mouse': 'Action',
+    'browser.touch_drag': 'Action',
+    'browser.route': 'Action',
+    'browser.unroute': 'Action',
+    'browser.release': 'Action',
   });
+  assert.deepEqual(
+    manifest.session.ports.map((port) => port.name),
+    ['origin', 'viewportWidth', 'viewportHeight', 'locale', 'timezoneId', 'initScript'],
+  );
+  for (const port of manifest.session.ports) {
+    assert.equal(port.direction, 'in');
+    assert.equal(port.required, port.name === 'origin');
+  }
   assert.equal(JSON.stringify(manifest).includes('playwright'), false);
+  assert.equal(JSON.stringify(manifest).includes('"pattern"'), false);
 });
 
 test('every browser capability declares an optional error output port', () => {
@@ -73,6 +104,42 @@ test('browser capability schemas are strict objects without pattern', () => {
   assert.deepEqual(
     byKey['browser.screenshot']?.ports.filter((port) => port.required).map((port) => port.name),
     ['name'],
+  );
+  assert.deepEqual(
+    byKey['browser.canvas_probe']?.ports.filter((port) => port.required).map((port) => port.name),
+    ['selector'],
+  );
+  assert.deepEqual(
+    byKey['browser.expect']?.ports.filter((port) => port.required).map((port) => port.name),
+    ['selector', 'assertion'],
+  );
+  assert.deepEqual(
+    byKey['browser.expect_url']?.ports.filter((port) => port.required).map((port) => port.name),
+    ['regex'],
+  );
+  assert.deepEqual(
+    byKey['browser.reload']?.ports.filter((port) => port.required).map((port) => port.name),
+    [],
+  );
+  assert.deepEqual(
+    byKey['browser.mouse']?.ports.filter((port) => port.required).map((port) => port.name),
+    ['action', 'selector', 'xRatio', 'yRatio'],
+  );
+  assert.deepEqual(
+    byKey['browser.touch_drag']?.ports.filter((port) => port.required).map((port) => port.name),
+    ['selector', 'xRatio', 'yRatio', 'toXRatio', 'toYRatio', 'steps'],
+  );
+  assert.deepEqual(
+    byKey['browser.route']?.ports.filter((port) => port.required).map((port) => port.name),
+    ['url', 'action'],
+  );
+  assert.deepEqual(
+    byKey['browser.unroute']?.ports.filter((port) => port.required).map((port) => port.name),
+    ['url'],
+  );
+  assert.deepEqual(
+    byKey['browser.release']?.ports.filter((port) => port.required).map((port) => port.name),
+    ['url', 'action'],
   );
 });
 

@@ -2,7 +2,16 @@ import { isDeepStrictEqual } from 'node:util';
 
 import type { AdapterManifest, CapabilityDefinition, PortDefinition } from './adapter-contract.ts';
 import { assertSupportedJsonSchema, dialectSchema, matchesJsonSchema } from './json-schema.ts';
-import type { CaseDefinition, JsonObject, LeafNode, PortBinding, SubTreeNode, TreeNode } from './types.ts';
+import { collectLeafSessions } from './sessions.ts';
+import type {
+  CaseDefinition,
+  JsonObject,
+  LeafNode,
+  PortBinding,
+  SessionBinding,
+  SubTreeNode,
+  TreeNode,
+} from './types.ts';
 
 type Frame = {
   id: number;
@@ -22,6 +31,7 @@ export function validateCaseCatalog(doc: CaseDefinition, manifests: readonly Ada
       `root.trees.${name}`,
       byId,
       doc.trees,
+      doc.sessions,
       {
         id: nextFrameId++,
         remap: new Map(),
@@ -32,6 +42,7 @@ export function validateCaseCatalog(doc: CaseDefinition, manifests: readonly Ada
       new Set([name]),
     );
   }
+  validateSessionRows(doc, byId);
 }
 
 function indexManifests(manifests: readonly AdapterManifest[]): Map<string, AdapterManifest> {
@@ -52,9 +63,56 @@ function indexManifests(manifests: readonly AdapterManifest[]): Map<string, Adap
         assertSupportedJsonSchema(port.schema, `${manifest.id}/${capability.key}.ports.${port.name}.schema`);
       }
     }
+    for (const port of manifest.session?.ports ?? []) {
+      if (port.direction !== 'in') {
+        throw new Error(`adapter ${manifest.id} session port ${port.name} must use direction in`);
+      }
+      assertSupportedJsonSchema(port.schema, `${manifest.id}.session.ports.${port.name}.schema`);
+    }
     byId.set(manifest.id, manifest);
   }
   return byId;
+}
+
+function validateSessionRows(doc: CaseDefinition, byId: Map<string, AdapterManifest>): void {
+  const needed = collectLeafSessions(doc.trees);
+  const rows = new Map<string, { row: SessionBinding; index: number }>();
+  for (const [index, row] of doc.sessions.entries()) {
+    const key = `${row.adapter}\0${row.actor}`;
+    rows.set(key, { row, index });
+  }
+  for (const pair of needed) {
+    const key = `${pair.adapter}\0${pair.actor}`;
+    const found = rows.get(key);
+    if (!found) {
+      throw new Error(`root.sessions is missing ${pair.adapter}/${pair.actor}`);
+    }
+    const manifest = byId.get(pair.adapter);
+    if (!manifest) {
+      throw new Error(`root.sessions.${found.index}.adapter ${pair.adapter} is not registered`);
+    }
+    validateSessionPortBindings(found.row.ports ?? {}, manifest, `root.sessions.${found.index}`);
+    rows.delete(key);
+  }
+  const extra = rows.values().next().value as { row: SessionBinding; index: number } | undefined;
+  if (extra) {
+    throw new Error(`root.sessions.${extra.index} ${extra.row.adapter}/${extra.row.actor} is not used by any leaf`);
+  }
+}
+
+function validateSessionPortBindings(
+  bindings: Record<string, PortBinding>,
+  manifest: AdapterManifest,
+  path: string,
+): void {
+  const ports = manifest.session?.ports ?? [];
+  const declared = new Map(ports.map((port) => [port.name, port]));
+  for (const name of Object.keys(bindings)) {
+    if (!declared.has(name)) throw new Error(`${path}.ports.${name} is not declared by ${manifest.id} session`);
+  }
+  for (const port of ports) {
+    validatePortBinding(bindings[port.name], port, path);
+  }
 }
 
 function walk(definition: TreeNode, path: string, byId: Map<string, AdapterManifest>): void {
@@ -129,11 +187,13 @@ function walkKeys(
   path: string,
   byId: Map<string, AdapterManifest>,
   trees: Record<string, TreeNode>,
+  sessions: readonly SessionBinding[],
   frame: Frame,
   seen: Map<string, JsonObject>,
   nextFrameId: () => number,
   walking: Set<string>,
 ): void {
+  if (frame.parent === null) recordSessionKeys(sessions, byId, frame, seen);
   if (definition.type === 'SubTree') {
     if (walking.has(definition.id)) return;
     const child = trees[definition.id];
@@ -143,6 +203,7 @@ function walkKeys(
       `root.trees.${definition.id}`,
       byId,
       trees,
+      sessions,
       pushFrame(frame, definition, nextFrameId),
       seen,
       nextFrameId,
@@ -156,17 +217,43 @@ function walkKeys(
   }
   if ('children' in definition) {
     definition.children.forEach((child, index) => {
-      walkKeys(child, `${path}.children.${index}`, byId, trees, frame, seen, nextFrameId, walking);
+      walkKeys(child, `${path}.children.${index}`, byId, trees, sessions, frame, seen, nextFrameId, walking);
     });
     return;
   }
   if ('if' in definition) {
-    walkKeys(definition.if, `${path}.if`, byId, trees, frame, seen, nextFrameId, walking);
-    walkKeys(definition.then, `${path}.then`, byId, trees, frame, seen, nextFrameId, walking);
-    if (definition.else) walkKeys(definition.else, `${path}.else`, byId, trees, frame, seen, nextFrameId, walking);
+    walkKeys(definition.if, `${path}.if`, byId, trees, sessions, frame, seen, nextFrameId, walking);
+    walkKeys(definition.then, `${path}.then`, byId, trees, sessions, frame, seen, nextFrameId, walking);
+    if (definition.else)
+      walkKeys(definition.else, `${path}.else`, byId, trees, sessions, frame, seen, nextFrameId, walking);
     return;
   }
-  walkKeys(definition.child, `${path}.child`, byId, trees, frame, seen, nextFrameId, walking);
+  walkKeys(definition.child, `${path}.child`, byId, trees, sessions, frame, seen, nextFrameId, walking);
+}
+
+function recordSessionKeys(
+  sessions: readonly SessionBinding[],
+  byId: Map<string, AdapterManifest>,
+  frame: Frame,
+  seen: Map<string, JsonObject>,
+): void {
+  for (const [index, row] of sessions.entries()) {
+    const manifest = byId.get(row.adapter);
+    if (!manifest) continue;
+    const bindings = row.ports ?? {};
+    for (const port of manifest.session?.ports ?? []) {
+      const binding = bindings[port.name];
+      if (!binding || !('key' in binding)) continue;
+      const resolved = resolveKey(frame, binding.key);
+      const identity = `${resolved.scopeId}:${resolved.key}`;
+      const existing = seen.get(identity);
+      const candidate = dialectSchema(port.schema);
+      if (existing && !isDeepStrictEqual(existing, candidate)) {
+        throw new Error(`root.sessions.${index}.ports.${port.name} key ${resolved.key} schema does not match`);
+      }
+      if (!existing) seen.set(identity, candidate);
+    }
+  }
 }
 
 function pushFrame(parent: Frame, node: SubTreeNode, nextFrameId: () => number): Frame {

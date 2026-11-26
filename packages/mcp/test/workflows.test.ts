@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { httpCaseWriteSchema } from '@tp/contract';
 
 import { TpApiError } from '../src/http.ts';
-import { createCaseAndRun, waitForRun, WAIT_POLL_INTERVAL_MS } from '../src/workflows.ts';
+import { createCaseAndRun, waitForRun } from '../src/workflows.ts';
 
 const definition = {
   main: 'Main',
@@ -14,12 +14,15 @@ const definition = {
       children: [{ type: 'Action', adapter: 'demo', actor: 'robot', capability: 'go' }],
     },
   },
+  sessions: [{ adapter: 'demo', actor: 'robot' }],
 };
-const write = httpCaseWriteSchema.parse({ name: 'n', definition });
+const write = httpCaseWriteSchema.parse({ name: 'n', description: 'n', definition });
 
 const createdCase = {
   id: 'case-1',
   name: 'n',
+  description: 'n',
+
   definition: write.definition,
   createdAt: '2026-09-16T00:00:00.000Z',
   updatedAt: '2026-09-16T00:00:00.000Z',
@@ -27,6 +30,7 @@ const createdCase = {
 
 const queuedRun = {
   id: 'run-1',
+  batchId: 'batch-1',
   caseId: 'case-1',
   status: 'queued',
   createdAt: '2026-09-16T00:00:00.000Z',
@@ -56,27 +60,67 @@ const queuedRun = {
   artifacts: [],
 };
 
-test('createCaseAndRun creates the case then the run', async () => {
+const queuedBatch = {
+  id: 'batch-1',
+  name: 'n',
+  description: '',
+  trigger: { kind: 'mcp' },
+  selection: { kind: 'cases' },
+  createdAt: queuedRun.createdAt,
+  startedAt: null,
+  finishedAt: null,
+  status: 'queued',
+  counts: { queued: 1, running: 0, canceling: 0, passed: 0, failed: 0, canceled: 0 },
+  runs: [queuedRun],
+};
+
+function unusedWatch() {
+  return {
+    watchRun() {
+      throw new Error('watchRun must not run');
+    },
+  };
+}
+
+function hangClock() {
+  return {
+    now: () => 0,
+    sleep: async (_ms: number, signal?: AbortSignal) => abortWhen(signal),
+  };
+}
+
+function abortWhen(signal?: AbortSignal): Promise<void> {
+  return new Promise((_resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('aborted'));
+      return;
+    }
+    signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+  });
+}
+
+test('createCaseAndRun creates the case then a single-case batch', async () => {
   const ids: string[] = [];
   const result = await createCaseAndRun(
     {
       invoke: async (id, input) => {
         ids.push(id);
         if (id === 'createCase') return createdCase;
-        if (id === 'createRun') {
-          assert.deepEqual(input, { body: { caseId: 'case-1' } });
-          return queuedRun;
+        if (id === 'createBatch') {
+          assert.deepEqual(input, { body: { caseIds: ['case-1'], trigger: { kind: 'mcp' } } });
+          return queuedBatch;
         }
         throw new Error(id);
       },
+      ...unusedWatch(),
     },
     write,
   );
-  assert.deepEqual(ids, ['createCase', 'createRun']);
-  assert.deepEqual(result, { case: createdCase, run: queuedRun });
+  assert.deepEqual(ids, ['createCase', 'createBatch']);
+  assert.deepEqual(result, { case: createdCase, batch: queuedBatch });
 });
 
-test('createCaseAndRun does not create a run when createCase fails', async () => {
+test('createCaseAndRun does not create a batch when createCase fails', async () => {
   const ids: string[] = [];
   await assert.rejects(
     () =>
@@ -86,6 +130,7 @@ test('createCaseAndRun does not create a run when createCase fails', async () =>
             ids.push(id);
             throw new TpApiError('invalid', 'bad case');
           },
+          ...unusedWatch(),
         },
         write,
       ),
@@ -94,7 +139,7 @@ test('createCaseAndRun does not create a run when createCase fails', async () =>
   assert.deepEqual(ids, ['createCase']);
 });
 
-test('createCaseAndRun keeps the case and mentions its id when createRun fails', async () => {
+test('createCaseAndRun keeps the case and mentions its id when createBatch fails', async () => {
   await assert.rejects(
     () =>
       createCaseAndRun(
@@ -103,12 +148,14 @@ test('createCaseAndRun keeps the case and mentions its id when createRun fails',
             if (id === 'createCase') return createdCase;
             throw new TpApiError('conflict', 'busy');
           },
+          ...unusedWatch(),
         },
         write,
       ),
     (error: unknown) => {
       assert.ok(error instanceof TpApiError);
       assert.equal(error.code, 'conflict');
+      assert.match(error.message, /createBatch/);
       assert.match(error.message, /case-1/);
       assert.match(error.message, /busy/);
       return true;
@@ -116,63 +163,58 @@ test('createCaseAndRun keeps the case and mentions its id when createRun fails',
   );
 });
 
-test('waitForRun returns the run when it is already terminal', async () => {
+test('waitForRun returns the run when the first SSE frame is terminal', async () => {
   const passed = { ...queuedRun, status: 'passed', startedAt: queuedRun.createdAt, finishedAt: queuedRun.createdAt };
   const result = await waitForRun(
     {
-      invoke: async () => passed,
-    },
-    { runId: 'run-1', timeoutMs: 1000 },
-    {
-      now: () => 0,
-      sleep: async () => {
-        throw new Error('sleep must not run');
+      invoke: async () => {
+        throw new Error('invoke must not run');
+      },
+      async *watchRun() {
+        yield passed;
       },
     },
+    { runId: 'run-1', timeoutMs: 1000 },
+    hangClock(),
   );
-  assert.equal(result, passed);
+  assert.deepEqual(result, passed);
 });
 
-test('waitForRun polls until a terminal status', async () => {
+test('waitForRun keeps watching until a terminal status', async () => {
   const passed = { ...queuedRun, status: 'canceled', startedAt: queuedRun.createdAt, finishedAt: queuedRun.createdAt };
-  let tick = 0;
-  const sleeps: number[] = [];
   const result = await waitForRun(
     {
       invoke: async () => {
-        tick += 1;
-        return tick === 1 ? queuedRun : passed;
+        throw new Error('invoke must not run');
+      },
+      async *watchRun() {
+        yield queuedRun;
+        yield passed;
       },
     },
     { runId: 'run-1', timeoutMs: 5000 },
-    {
-      now: () => 0,
-      sleep: async (ms) => {
-        sleeps.push(ms);
-      },
-    },
+    hangClock(),
   );
-  assert.equal(result, passed);
-  assert.deepEqual(sleeps, [WAIT_POLL_INTERVAL_MS]);
+  assert.deepEqual(result, passed);
 });
 
 test('waitForRun fails on timeout with the last status', async () => {
   await assert.rejects(
     () =>
       waitForRun(
-        { invoke: async () => queuedRun },
+        {
+          invoke: async () => {
+            throw new Error('invoke must not run');
+          },
+          async *watchRun(_id, options) {
+            yield queuedRun;
+            await abortWhen(options?.signal);
+          },
+        },
         { runId: 'run-1', timeoutMs: 1 },
         {
-          now: (() => {
-            let n = 0;
-            return () => {
-              n += 1;
-              return n === 1 ? 0 : 2;
-            };
-          })(),
-          sleep: async () => {
-            throw new Error('sleep must not run after deadline');
-          },
+          now: () => 0,
+          sleep: async () => undefined,
         },
       ),
     /queued/,
@@ -185,46 +227,55 @@ test('waitForRun fails immediately when the run is missing', async () => {
       waitForRun(
         {
           invoke: async () => {
+            throw new Error('invoke must not run');
+          },
+          watchRun() {
             throw new TpApiError('not_found', 'run missing');
           },
         },
         { runId: 'missing', timeoutMs: 1000 },
-        { now: () => 0, sleep: async () => undefined },
+        hangClock(),
       ),
     /run missing/,
   );
 });
 
-test('waitForRun rejects missing keys before getRun', async () => {
-  const ids: string[] = [];
+test('waitForRun rejects missing keys before watchRun', async () => {
+  const calls: string[] = [];
   await assert.rejects(() =>
     waitForRun(
       {
-        invoke: async (id) => {
-          ids.push(id);
+        invoke: async () => {
           throw new Error('unused');
+        },
+        async *watchRun() {
+          calls.push('watchRun');
+          yield;
         },
       },
       {},
       { now: () => 0, sleep: async () => undefined },
     ),
   );
-  assert.deepEqual(ids, []);
+  assert.deepEqual(calls, []);
 });
 
-test('waitForRun rejects timeoutMs 0 before getRun', async () => {
-  const ids: string[] = [];
+test('waitForRun rejects timeoutMs 0 before watchRun', async () => {
+  const calls: string[] = [];
   await assert.rejects(() =>
     waitForRun(
       {
-        invoke: async (id) => {
-          ids.push(id);
+        invoke: async () => {
           throw new Error('unused');
+        },
+        async *watchRun() {
+          calls.push('watchRun');
+          yield;
         },
       },
       { runId: 'run-1', timeoutMs: 0 },
       { now: () => 0, sleep: async () => undefined },
     ),
   );
-  assert.deepEqual(ids, []);
+  assert.deepEqual(calls, []);
 });

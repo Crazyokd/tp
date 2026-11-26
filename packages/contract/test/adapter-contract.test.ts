@@ -63,11 +63,35 @@ test('manifest rejects a capability without ports or with unknown fields', () =>
   );
 });
 
-test('session context is only runId and actor', () => {
-  const context: AdapterSessionContext = { runId: 'run-1', actor: 'robot1' };
+test('session context includes assembled session input', () => {
+  const context: AdapterSessionContext = {
+    runId: 'run-1',
+    actor: 'robot1',
+    resourceRoot: '/tmp/run-1',
+    recordArtifact: () => ({ id: 'a1' }),
+    input: { container: 'demo' },
+  };
   assert.equal(context.runId, 'run-1');
   assert.equal(context.actor, 'robot1');
-  assert.deepEqual(Object.keys(context).sort(), ['actor', 'runId']);
+  assert.deepEqual(context.input, { container: 'demo' });
+});
+
+test('manifest accepts empty session ports and rejects out session ports', () => {
+  const parsed = adapterManifestSchema.parse({
+    id: 'demo',
+    moduleEntry: '@tp/adapter-demo',
+    capabilities: [{ key: 'demo.go', kind: 'Action', label: 'Go', ports: [] }],
+    session: { ports: [] },
+  });
+  assert.deepEqual(parsed.session, { ports: [] });
+  assert.throws(() =>
+    adapterManifestSchema.parse({
+      id: 'demo',
+      moduleEntry: '@tp/adapter-demo',
+      capabilities: [{ key: 'demo.go', kind: 'Action', label: 'Go', ports: [] }],
+      session: { ports: [{ name: 'shot', direction: 'out', schema: { type: 'string' } }] },
+    }),
+  );
 });
 
 test('tick receives assembled input and returns status plus port output', async () => {

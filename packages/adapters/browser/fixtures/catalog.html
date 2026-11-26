@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Browser Catalog Fixture</title>
+  </head>
+  <body>
+    <h1>Catalog</h1>
+    <button type="button" id="next">下一步</button>
+    <button type="button" id="gone" hidden>已隐藏</button>
+    <button type="button" id="disabled" disabled>不可点</button>
+    <label>
+      名称
+      <input id="name" type="text" value="example-a" />
+    </label>
+    <section aria-label="虚拟键盘">
+      <button type="button" class="hg-button-enter">确认</button>
+    </section>
+    <label><input id="charge" type="checkbox" />充电桩</label>
+    <button type="button" id="busy" aria-busy="true">忙碌</button>
+    <p class="item">one</p>
+    <p class="item">two</p>
+    <p id="status">idle</p>
+    <p id="lang"></p>
+    <p id="width"></p>
+    <p id="timezone"></p>
+    <p id="touch-state">none</p>
+    <div id="pad" style="width: 200px; height: 200px; background: #ddd; position: relative; touch-action: none">
+      <div id="dot" style="width: 8px; height: 8px; background: #c00; position: absolute; left: 0; top: 0"></div>
+    </div>
+    <canvas id="canvas" width="200" height="120"></canvas>
+    <button type="button" id="paint">重绘</button>
+    <a id="other" href="/other">other</a>
+    <script>
+      document.getElementById('lang').textContent = navigator.language;
+      document.getElementById('width').textContent = String(window.innerWidth);
+      document.getElementById('timezone').textContent = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      document.getElementById('status').textContent = sessionStorage.getItem('mode') || 'none';
+      const next = document.getElementById('next');
+      next.addEventListener('click', async () => {
+        next.disabled = true;
+        next.setAttribute('aria-busy', 'true');
+        try {
+          const response = await fetch('/api/demo/submit', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name: document.getElementById('name').value }),
+          });
+          document.getElementById('status').textContent = response.ok ? 'started' : `failed:${response.status}`;
+        } catch {
+          document.getElementById('status').textContent = 'blocked';
+        } finally {
+          next.disabled = false;
+          next.removeAttribute('aria-busy');
+        }
+      });
+      const pad = document.getElementById('pad');
+      let touchStart;
+      let touchMoves = 0;
+      pad.addEventListener('touchmove', () => {
+        document.getElementById('touch-state').dataset.moves = String(++touchMoves);
+        if (touchMoves === 1) fetch('/touch-observed');
+      });
+      pad.addEventListener('touchcancel', () => {
+        document.getElementById('touch-state').textContent = 'canceled';
+      });
+      pad.addEventListener('touchstart', (event) => {
+        touchStart = event.touches[0];
+      });
+      pad.addEventListener('touchend', (event) => {
+        const end = event.changedTouches[0];
+        document.getElementById('touch-state').textContent =
+          `${event.isTrusted}:${Math.round(end.clientX - touchStart.clientX)}:${Math.round(end.clientY - touchStart.clientY)}`;
+      });
+      pad.addEventListener('mouseup', (event) => {
+        const box = pad.getBoundingClientRect();
+        document.getElementById('status').textContent =
+          `up:${Math.round(event.clientX - box.left)}:${Math.round(event.clientY - box.top)}`;
+      });
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      function draw(color, cx) {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = color;
+        ctx.fillRect(cx - 8, canvas.height / 2 - 8, 16, 16);
+      }
+      draw('#0033cc', canvas.width / 2);
+      document.getElementById('paint').addEventListener('click', () => {
+        draw('#cc3300', 40);
+      });
+    </script>
+  </body>
+</html>

@@ -111,6 +111,26 @@ test('sequence runs actions in order and records node results', async () => {
   assert.deepEqual(calls, ['demo.mapping.start', 'demo.localization.ready']);
 });
 
+test('reactive guard progress can be recorded on every tick while a task is running', async () => {
+  const definition: TreeNode = {
+    type: 'ReactiveSequence',
+    children: [
+      { type: 'Condition', adapter: 'test', actor: 'robot', capability: 'guard' },
+      { type: 'Action', adapter: 'test', actor: 'robot', capability: 'work' },
+    ],
+  };
+  let snapshot = createProgressSnapshot(definition);
+  let work = 0;
+  const result = await executeTree(definition, {
+    adapter: async (node) => ({ status: node.capability === 'work' && ++work < 3 ? 'RUNNING' : 'SUCCESS' }),
+    onProgress: (event) => {
+      snapshot = applyRunProgressEvent(snapshot, event);
+    },
+  });
+  assert.equal(result.status, 'passed');
+  assert.ok(findRunNode(snapshot.tree, 'children.0').attempts.length >= 3);
+});
+
 test('sequence stops at the first failing action', async () => {
   const calls = [];
   const result = await executeTree(
@@ -624,7 +644,7 @@ test('progress callback rejection stops execution and is not covered by false fi
 });
 
 test('executeTree progress events are all accepted by the run-progress reducer', async () => {
-  const definition: CaseDefinition = {
+  const definition: TreeNode = {
     type: 'RetryUntilSuccessful',
     num_attempts: 2,
     child: { type: 'Action', capability: 'demo.reducer', adapter: 'demo', actor: 'robot-2' },
@@ -652,7 +672,7 @@ test('executeTree progress events are all accepted by the run-progress reducer',
 });
 
 test('run-progress accepts every attempt when Retry wraps Timeout', async () => {
-  const definition: CaseDefinition = {
+  const definition: TreeNode = {
     type: 'RetryUntilSuccessful',
     num_attempts: 2,
     child: {
@@ -682,7 +702,7 @@ test('run-progress accepts every attempt when Retry wraps Timeout', async () => 
 });
 
 test('generated timestamps stay nondecreasing when the injected wall clock moves backward', async () => {
-  const definition: CaseDefinition = {
+  const definition: TreeNode = {
     type: 'Sequence',
     children: [{ type: 'Action', capability: 'demo.clock', adapter: 'demo', actor: 'robot' }],
   };
@@ -782,7 +802,7 @@ test('executeTree rejects a structurally illegal tree document', async () => {
   await assert.rejects(
     () =>
       executeDocument(
-        { main: 'Main', trees: { Main: { type: 'Sequence', children: [] } } },
+        { main: 'Main', trees: { Main: { type: 'Sequence', children: [] } }, sessions: [] },
         { adapter: testLeafAdapter },
       ),
     /children/,
@@ -808,4 +828,52 @@ test('a leaf without a registered capability is a run accident', async () => {
       }),
     /not registered/,
   );
+});
+
+test('running loop waits tickIntervalMs between tree ticks', async () => {
+  let ticks = 0;
+  const started = Date.now();
+  const result = await executeTree(
+    {
+      type: 'RetryUntilSuccessful',
+      num_attempts: -1,
+      child: { type: 'Condition', capability: 'demo.eventually_ready', adapter: 'demo', actor: 'robot' },
+    },
+    {
+      tickIntervalMs: 20,
+      adapter: async () => {
+        ticks += 1;
+        return { status: ticks >= 5 ? 'SUCCESS' : 'FAILURE' };
+      },
+    },
+  );
+
+  assert.equal(result.status, 'passed');
+  assert.equal(ticks, 5);
+  // 5 次 tick 之间有 4 个 RUNNING 间隔，每个至少 20ms（留 5ms 计时余量）。
+  assert.ok(Date.now() - started >= 75, `expected throttled loop, took ${Date.now() - started}ms`);
+});
+
+test('abort interrupts the tick interval wait', async () => {
+  const controller = new AbortController();
+  const started = Date.now();
+  const resultPromise = executeTree(
+    {
+      type: 'RetryUntilSuccessful',
+      num_attempts: -1,
+      child: { type: 'Condition', capability: 'demo.eventually_ready', adapter: 'demo', actor: 'robot' },
+    },
+    {
+      tickIntervalMs: 60_000,
+      signal: controller.signal,
+      adapter: async () => {
+        setTimeout(() => controller.abort(), 20);
+        return { status: 'FAILURE' };
+      },
+    },
+  );
+
+  const result = await resultPromise;
+  assert.equal(result.status, 'canceled');
+  assert.ok(Date.now() - started < 5_000, `abort should break the interval wait, took ${Date.now() - started}ms`);
 });

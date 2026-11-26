@@ -1,9 +1,11 @@
 import {
+  collectLeafSessions,
   requireCaseDefinition,
   type CaseDefinition,
   type CatalogCapability,
   type LeafNode,
   type NodeType,
+  type SessionBinding,
   type TreeNode,
 } from '@tp/contract';
 
@@ -78,7 +80,15 @@ export type WrapperFields = {
 };
 
 export function defaultDefinition(): CaseDefinition {
-  return { main: 'Main', trees: { Main: { type: 'Sequence', children: [] } } };
+  return { main: 'Main', trees: { Main: { type: 'Sequence', children: [] } }, sessions: [] };
+}
+
+export function syncCaseSessions(definition: CaseDefinition): CaseDefinition {
+  const existing = new Map(definition.sessions.map((row) => [`${row.adapter}\0${row.actor}`, row] as const));
+  const sessions: SessionBinding[] = collectLeafSessions(definition.trees).map(
+    (pair) => existing.get(`${pair.adapter}\0${pair.actor}`) ?? { ...pair, ports: {} },
+  );
+  return { ...definition, sessions };
 }
 
 export function rootTree(definition: CaseDefinition): TreeNode {

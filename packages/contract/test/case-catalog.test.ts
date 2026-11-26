@@ -3,7 +3,8 @@ import { test } from 'node:test';
 
 import type { AdapterManifest, CapabilityDefinition, PortDefinition } from '../src/adapter-contract.ts';
 import { validateCaseCatalog } from '../src/case-catalog.ts';
-import type { CaseDefinition, LeafNode, TreeNode } from '../src/types.ts';
+import { sessionsForLeaves } from '../src/sessions.ts';
+import type { CaseDefinition, LeafNode, SessionBinding, TreeNode } from '../src/types.ts';
 
 function leaf(capability: string, extra: Partial<LeafNode> = {}): LeafNode {
   return {
@@ -16,8 +17,9 @@ function leaf(capability: string, extra: Partial<LeafNode> = {}): LeafNode {
   };
 }
 
-function doc(node: TreeNode, extraTrees: Record<string, TreeNode> = {}): CaseDefinition {
-  return { main: 'Main', trees: { Main: node, ...extraTrees } };
+function doc(node: TreeNode, extraTrees: Record<string, TreeNode> = {}, sessions?: SessionBinding[]): CaseDefinition {
+  const trees = { Main: node, ...extraTrees };
+  return { main: 'Main', trees, sessions: sessions ?? sessionsForLeaves(trees) };
 }
 
 function port(
@@ -404,6 +406,7 @@ test('reports the first tree error and stops', () => {
             Alpha: leaf('missing-a'),
             Beta: leaf('missing-b'),
           },
+          sessions: [{ adapter: 'test', actor: 'robot', ports: {} }],
         },
         [pass],
       ),
@@ -473,6 +476,114 @@ test('treats omitted additionalProperties as false when comparing key schemas', 
         ],
       }),
       [writePose, readPose],
+    ),
+  );
+});
+
+test('rejects a case that omits a session row for a leaf actor', () => {
+  assert.throws(() => validateCaseCatalog(doc(leaf('pass'), {}, []), [pass]), /root\.sessions is missing test\/robot/);
+});
+
+test('rejects a session row that no leaf uses', () => {
+  assert.throws(
+    () =>
+      validateCaseCatalog(
+        doc(leaf('pass'), {}, [
+          { adapter: 'test', actor: 'robot' },
+          { adapter: 'test', actor: 'spare' },
+        ]),
+        [pass],
+      ),
+    /not used by any leaf/,
+  );
+});
+
+test('treats demo and browser actors with the same name as distinct sessions', () => {
+  const browser = adapter([{ key: 'pass', kind: 'Action', label: 'Pass', ports: [] }], { id: 'browser' });
+  assert.doesNotThrow(() =>
+    validateCaseCatalog(
+      doc(
+        {
+          type: 'Sequence',
+          children: [leaf('pass'), leaf('pass', { adapter: 'browser' })],
+        },
+        {},
+        [
+          { adapter: 'test', actor: 'robot' },
+          { adapter: 'browser', actor: 'robot' },
+        ],
+      ),
+      [pass, browser],
+    ),
+  );
+});
+
+test('rejects a missing required session port', () => {
+  const demo = adapter([{ key: 'pass', kind: 'Action', label: 'Pass', ports: [] }], {
+    id: 'demo',
+    session: { ports: [port('container', 'in')] },
+  });
+  assert.throws(
+    () =>
+      validateCaseCatalog(doc(leaf('pass', { adapter: 'demo' }), {}, [{ adapter: 'demo', actor: 'robot' }]), [demo]),
+    /container is required/,
+  );
+});
+
+test('accepts a session port wired to a blackboard key and rejects a schema clash', () => {
+  const named = adapter(
+    [
+      {
+        key: 'named',
+        kind: 'Action',
+        label: 'Named',
+        ports: [port('name', 'in', { schema: { type: 'number' } })],
+      },
+    ],
+    { session: { ports: [port('label', 'in', { schema: { type: 'string' } })] } },
+  );
+  assert.throws(
+    () =>
+      validateCaseCatalog(
+        doc(leaf('named', { ports: { name: { key: 'shared' } } }), {}, [
+          { adapter: 'test', actor: 'robot', ports: { label: { key: 'shared' } } },
+        ]),
+        [named],
+      ),
+    /key shared schema does not match/,
+  );
+  const aligned = adapter(
+    [
+      {
+        key: 'named',
+        kind: 'Action',
+        label: 'Named',
+        ports: [port('name', 'in')],
+      },
+    ],
+    { session: { ports: [port('label', 'in')] } },
+  );
+  assert.doesNotThrow(() =>
+    validateCaseCatalog(
+      doc(leaf('named', { ports: { name: { key: 'shared' } } }), {}, [
+        { adapter: 'test', actor: 'robot', ports: { label: { key: 'shared' } } },
+      ]),
+      [aligned],
+    ),
+  );
+});
+
+test('accepts a required session port literal', () => {
+  const demo = adapter([{ key: 'pass', kind: 'Action', label: 'Pass', ports: [] }], {
+    id: 'demo',
+    session: { ports: [port('container', 'in')] },
+  });
+  assert.doesNotThrow(() =>
+    validateCaseCatalog(
+      doc(leaf('pass', { adapter: 'demo' }), {}, [
+        { adapter: 'demo', actor: 'robot', ports: { container: { literal: 'demo' } } },
+      ]),
+      [demo],
     ),
   );
 });

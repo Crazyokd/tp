@@ -13,7 +13,7 @@ import type {
 } from '@tp/contract/adapter';
 import {
   appendRunArtifact,
-  applyRunProgressEvent,
+  recordRunProgressEvent,
   failedRunError,
   type Artifact,
   type LiveRun,
@@ -23,9 +23,10 @@ import {
 } from '@tp/contract';
 import { isJsonValue } from '@tp/contract/json-schema';
 import { logger } from './log.ts';
-import { executeTree, WorkerFatalError } from './bt.ts';
+import { DEFAULT_TREE_TICK_INTERVAL_MS, executeTree, WorkerFatalError } from './bt.ts';
+import { assembleSessionInput, MissingLeafInputError } from './leaf-ports.ts';
 import { createRunArtifactStore } from './run-artifacts.ts';
-import { cleanupAdapterSessions } from './session-cleanup.ts';
+import { cleanupAdapterSessions, DEFAULT_SESSION_CLEANUP_TIMEOUT_MS } from './session-cleanup.ts';
 
 type RunMessage = {
   type: 'run';
@@ -33,6 +34,7 @@ type RunMessage = {
   adapters: AdapterManifest[];
   workspaceRoot: string;
   sessionCleanupTimeoutMs?: number;
+  treeTickIntervalMs?: number;
 };
 
 type CancelMessage = {
@@ -57,7 +59,6 @@ if (!port) throw new Error('worker-thread must run inside a Worker');
 const postMessage = port.postMessage.bind(port);
 
 const adapterModules = new Map<string, AdapterModule>();
-const DEFAULT_SESSION_CLEANUP_TIMEOUT_MS = 10_000;
 const pendingCancels = new Set<string>();
 let current: { runId: string; controller: AbortController } | undefined;
 
@@ -119,17 +120,19 @@ async function executeRun(message: RunMessage, signal: AbortSignal): Promise<Wor
       capabilities: message.adapters.flatMap((adapter) =>
         adapter.capabilities.map((capability) => ({ ...capability, adapter: adapter.id })),
       ),
-      adapter: (node, context) =>
-        executeLeaf(message, node, sessions, context, sessionReady, resourceRoot, store.recordArtifact),
+      adapter: (node, context, lookup) =>
+        executeLeaf(message, node, sessions, context, lookup, sessionReady, resourceRoot, store.recordArtifact),
+      initialBlackboard: message.run.blackboard,
       haltLeaf: async (node) => {
         await sessions.get(sessionKey(node.adapter, node.actor))?.halt(node);
       },
       onProgress: (event) => {
-        snapshot = applyRunProgressEvent(snapshot, event);
+        recordRunProgressEvent(snapshot, event);
         postMessage({ type: 'progress', runId: message.run.id, event });
       },
       nextRevision,
       signal,
+      tickIntervalMs: message.treeTickIntervalMs ?? DEFAULT_TREE_TICK_INTERVAL_MS,
     });
     result = {
       status: tree.status,
@@ -187,6 +190,7 @@ async function executeLeaf(
   node: RuntimeLeaf,
   sessions: Map<string, AdapterSession>,
   context: LeafTickContext,
+  lookup: (key: string) => unknown,
   sessionReady: Set<Promise<void>>,
   resourceRoot: string,
   recordArtifact: AdapterSessionContext['recordArtifact'],
@@ -197,7 +201,7 @@ async function executeLeaf(
   });
   sessionReady.add(ready);
   try {
-    return await executeLeafBody(message, node, sessions, context, notifyReady, resourceRoot, recordArtifact);
+    return await executeLeafBody(message, node, sessions, context, lookup, notifyReady, resourceRoot, recordArtifact);
   } catch (error) {
     notifyReady();
     throw error;
@@ -209,6 +213,7 @@ async function executeLeafBody(
   node: RuntimeLeaf,
   sessions: Map<string, AdapterSession>,
   context: LeafTickContext,
+  lookup: (key: string) => unknown,
   notifyReady: () => void,
   resourceRoot: string,
   recordArtifact: AdapterSessionContext['recordArtifact'],
@@ -234,13 +239,19 @@ async function executeLeafBody(
       adapterModules.set(manifest.moduleEntry, module);
     }
     try {
+      const row = message.run.definition.sessions.find(
+        (candidate) => candidate.adapter === node.adapter && candidate.actor === node.actor,
+      );
+      if (!row) throw new WorkerFatalError(`session ${node.adapter}/${node.actor} is not configured`);
       session = await module.createSession({
         runId: message.run.id,
         actor: node.actor,
         resourceRoot,
         recordArtifact,
+        input: assembleSessionInput(row, manifest.session?.ports ?? [], lookup),
       });
     } catch (error) {
+      if (error instanceof MissingLeafInputError) throw error;
       throw new WorkerFatalError(error instanceof Error ? error.message : String(error), { cause: error });
     }
     sessions.set(key, session);

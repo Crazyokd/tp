@@ -17,6 +17,7 @@ type WorkerPoolOptions = {
   onRunFatal?: (runId: string, result: WorkerThreadResult) => Promise<void>;
   onFatal?: (error: Error) => void;
   sessionCleanupTimeoutMs?: number;
+  treeTickIntervalMs?: number;
   workerFactory?: (url: URL) => Worker;
   metrics?: ServerMetrics;
 };
@@ -85,6 +86,7 @@ export function createWorkerPool(options: WorkerPoolOptions) {
       adapters: options.registry.listAdapters(),
       workspaceRoot: options.workspaceRoot,
       sessionCleanupTimeoutMs: options.sessionCleanupTimeoutMs,
+      treeTickIntervalMs: options.treeTickIntervalMs,
     });
   }
 

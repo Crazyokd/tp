@@ -5,6 +5,7 @@ import { portDefinitionSchema } from './adapter-contract.ts';
 import { caseDocumentSchema } from './case-document.ts';
 import { apiPaths } from './http.ts';
 import { pageQuerySchema, pageSchema } from './http-page.ts';
+import { isJsonValue } from './json-value.ts';
 import { assertPreconditionSyntax } from './precondition.ts';
 
 const emptyQuerySchema = z.object({}).strict();
@@ -23,6 +24,10 @@ export const httpAdapterSchema = z
   .object({
     id: z.string().trim().min(1),
     capabilities: z.array(catalogCapabilitySchema),
+    session: z
+      .object({ ports: z.array(portDefinitionSchema) })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -31,6 +36,7 @@ const caseDefinitionSchema = caseDocumentSchema;
 export const httpCaseWriteSchema = z
   .object({
     name: z.string().trim().min(1),
+    description: z.string().trim().min(1),
     definition: caseDefinitionSchema,
   })
   .strict();
@@ -39,11 +45,27 @@ export const httpCaseSchema = z
   .object({
     id: z.string().trim().min(1),
     name: z.string().trim().min(1),
+    description: z.string().trim().min(1),
     definition: caseDefinitionSchema,
     createdAt: z.string(),
     updatedAt: z.string(),
   })
   .strict();
+
+export const httpGroupWriteSchema = z
+  .object({
+    name: z.string().trim().min(1),
+    caseIds: z.array(z.string().trim().min(1)).refine((ids) => new Set(ids).size === ids.length, {
+      message: 'duplicate case ids',
+    }),
+  })
+  .strict();
+
+export const httpGroupSchema = httpGroupWriteSchema.extend({
+  id: z.string().trim().min(1),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
 
 const httpRunStatusSchema = z.enum(['queued', 'running', 'canceling', 'passed', 'failed', 'canceled']);
 
@@ -275,7 +297,14 @@ const runTreeSchema = z
 
 export const httpRunSchema = z
   .object({
-    id: z.string().trim().min(1),
+    id: z
+      .string()
+      .trim()
+      .min(1)
+      .refine((id) => id !== '.' && id !== '..' && !/[/\\\0]/.test(id), {
+        message: 'invalid run resource root',
+      }),
+    batchId: z.string().trim().min(1),
     caseId: z.string().trim().min(1),
     status: httpRunStatusSchema,
     createdAt: z.string(),
@@ -315,11 +344,148 @@ export const httpRunSchema = z
     }
   });
 
-export const httpRunCreateSchema = z
+const blackboardKey = z
+  .string()
+  .min(1)
+  .refine((key) => key === key.trim(), { message: 'padded keys are illegal' });
+
+export const httpBatchTriggerSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('web') }).strict(),
+  z.object({ kind: z.literal('mcp') }).strict(),
+  z
+    .object({
+      kind: z.literal('ci'),
+      pipelineUrl: z
+        .string()
+        .trim()
+        .url()
+        .regex(/^https?:\/\//)
+        .optional(),
+    })
+    .strict(),
+]);
+
+export const httpBatchSelectionSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('cases') }).strict(),
+  z
+    .object({ kind: z.literal('group'), groupId: z.string().trim().min(1), groupName: z.string().trim().min(1) })
+    .strict(),
+]);
+
+export const httpBatchMetadataSchema = z
   .object({
-    caseId: z.string().trim().min(1),
+    name: z.string().trim().min(1),
+    description: z.string(),
+    trigger: httpBatchTriggerSchema,
+    selection: httpBatchSelectionSchema,
   })
   .strict();
+
+export const httpBatchSchema = httpBatchMetadataSchema
+  .extend({
+    id: z.string().trim().min(1),
+    createdAt: z.string(),
+    startedAt: z.string().nullable(),
+    finishedAt: z.string().nullable(),
+    status: z.enum(['queued', 'running', 'passed', 'failed', 'canceled']),
+    counts: z
+      .object({
+        queued: z.number().int().nonnegative(),
+        running: z.number().int().nonnegative(),
+        canceling: z.number().int().nonnegative(),
+        passed: z.number().int().nonnegative(),
+        failed: z.number().int().nonnegative(),
+        canceled: z.number().int().nonnegative(),
+      })
+      .strict(),
+    runs: z.array(httpRunSchema).min(1),
+  })
+  .strict();
+
+export const httpBatchCreateSchema = z
+  .object({
+    name: z.string().trim().min(1).optional(),
+    description: z.string().optional(),
+    trigger: httpBatchTriggerSchema,
+    caseIds: z
+      .array(z.string().trim().min(1))
+      .min(1)
+      .refine((ids) => new Set(ids).size === ids.length, {
+        message: 'duplicate case ids',
+      })
+      .meta({ uniqueItems: true })
+      .optional(),
+    groupId: z.string().trim().min(1).optional(),
+    blackboard: z.record(blackboardKey, z.unknown()).optional(),
+  })
+  .strict()
+  .superRefine((body, ctx) => {
+    if ((body.caseIds === undefined) === (body.groupId === undefined)) {
+      ctx.addIssue({ code: 'custom', message: 'exactly one of caseIds or groupId' });
+    }
+    for (const [key, value] of Object.entries(body.blackboard ?? {})) {
+      if (!isJsonValue(value)) ctx.addIssue({ code: 'custom', message: `blackboard ${key} is not JSON` });
+    }
+  })
+  .meta({ oneOf: [{ required: ['caseIds'] }, { required: ['groupId'] }] });
+
+const httpRunImportFileSchema = z
+  .object({
+    runId: z.string().trim().min(1),
+    artifactId: z.string().trim().min(1),
+    path: z.string().trim().min(1),
+    contentBase64: z.string(),
+  })
+  .strict();
+
+export const httpBatchImportSchema = httpBatchMetadataSchema
+  .extend({
+    runs: z.array(httpRunSchema).min(1),
+    files: z.array(httpRunImportFileSchema),
+  })
+  .strict()
+  .superRefine((body, ctx) => {
+    const batchId = body.runs[0]?.batchId;
+    if (body.runs.some((run) => run.batchId !== batchId)) {
+      ctx.addIssue({ code: 'custom', message: 'imported runs must share one batchId' });
+    }
+    const runIds = new Set<string>();
+    for (const run of body.runs) {
+      if (run.status === 'queued' || run.status === 'running' || run.status === 'canceling') {
+        ctx.addIssue({ code: 'custom', message: 'imported runs must be terminal' });
+      }
+      if (runIds.has(run.id)) ctx.addIssue({ code: 'custom', message: `duplicate run id ${run.id}` });
+      runIds.add(run.id);
+      const artifactIds = new Set<string>();
+      for (const artifact of run.artifacts) {
+        if (artifactIds.has(artifact.id)) {
+          ctx.addIssue({ code: 'custom', message: `duplicate artifact id ${artifact.id}` });
+        }
+        artifactIds.add(artifact.id);
+      }
+    }
+    const expected = body.runs.flatMap((run) => run.artifacts.map((artifact) => `${run.id}\0${artifact.id}`));
+    const actual = body.files.map((file) => `${file.runId}\0${file.artifactId}`);
+    const expectedSet = new Set(expected);
+    const actualSet = new Set(actual);
+    if (
+      expected.length !== expectedSet.size ||
+      actual.length !== actualSet.size ||
+      expectedSet.size !== actualSet.size
+    ) {
+      ctx.addIssue({ code: 'custom', message: 'artifact files must match run artifacts' });
+      return;
+    }
+    for (const key of expectedSet) {
+      if (!actualSet.has(key)) ctx.addIssue({ code: 'custom', message: 'artifact files must match run artifacts' });
+    }
+    for (const run of body.runs) {
+      const paths = body.files.filter((file) => file.runId === run.id).map((file) => file.path);
+      if (new Set(paths).size !== paths.length) {
+        ctx.addIssue({ code: 'custom', message: `duplicate artifact path on run ${run.id}` });
+      }
+    }
+  });
 
 // Server reads repeatable `status` via URLSearchParams.getAll('status').
 export const listRunsQuerySchema = pageQuerySchema.extend({
@@ -387,7 +553,7 @@ export const httpMetricsSchema = z
 
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
 export type SuccessStatus = 200 | 201 | 204;
-export type HttpApiTag = 'Adapters' | 'Cases' | 'Runs' | 'Workers' | 'Ops';
+export type HttpApiTag = 'Adapters' | 'Groups' | 'Cases' | 'Batches' | 'Runs' | 'Workers' | 'Ops';
 
 export type HttpOperation = {
   id: string;
@@ -472,6 +638,56 @@ export const operations: readonly HttpOperation[] = [
     successStatus: 204,
   },
   {
+    id: 'listGroups',
+    method: 'GET',
+    path: apiPaths.groups,
+    tag: 'Groups',
+    query: pageQuerySchema,
+    body: null,
+    response: pageSchema(httpGroupSchema),
+    successStatus: 200,
+  },
+  {
+    id: 'createGroup',
+    method: 'POST',
+    path: apiPaths.groups,
+    tag: 'Groups',
+    query: emptyQuerySchema,
+    body: httpGroupWriteSchema,
+    response: httpGroupSchema,
+    successStatus: 201,
+  },
+  {
+    id: 'getGroup',
+    method: 'GET',
+    path: `${apiPaths.groups}/:id`,
+    tag: 'Groups',
+    query: emptyQuerySchema,
+    body: null,
+    response: httpGroupSchema,
+    successStatus: 200,
+  },
+  {
+    id: 'updateGroup',
+    method: 'PUT',
+    path: `${apiPaths.groups}/:id`,
+    tag: 'Groups',
+    query: emptyQuerySchema,
+    body: httpGroupWriteSchema,
+    response: httpGroupSchema,
+    successStatus: 200,
+  },
+  {
+    id: 'deleteGroup',
+    method: 'DELETE',
+    path: `${apiPaths.groups}/:id`,
+    tag: 'Groups',
+    query: emptyQuerySchema,
+    body: null,
+    response: null,
+    successStatus: 204,
+  },
+  {
     id: 'listRuns',
     method: 'GET',
     path: apiPaths.runs,
@@ -482,23 +698,63 @@ export const operations: readonly HttpOperation[] = [
     successStatus: 200,
   },
   {
-    id: 'createRun',
+    id: 'listBatches',
+    method: 'GET',
+    path: apiPaths.batches,
+    tag: 'Batches',
+    query: pageQuerySchema,
+    body: null,
+    response: pageSchema(httpBatchSchema),
+    successStatus: 200,
+  },
+  {
+    id: 'createBatch',
     method: 'POST',
-    path: apiPaths.runs,
-    tag: 'Runs',
+    path: apiPaths.batches,
+    tag: 'Batches',
     query: emptyQuerySchema,
-    body: httpRunCreateSchema,
-    response: httpRunSchema,
+    body: httpBatchCreateSchema,
+    response: httpBatchSchema,
     successStatus: 201,
   },
   {
-    id: 'getRun',
+    id: 'importBatch',
+    method: 'POST',
+    path: `${apiPaths.batches}/import`,
+    tag: 'Batches',
+    query: emptyQuerySchema,
+    body: httpBatchImportSchema,
+    response: httpBatchSchema,
+    successStatus: 201,
+  },
+  {
+    id: 'getBatch',
     method: 'GET',
-    path: `${apiPaths.runs}/:id`,
+    path: `${apiPaths.batches}/:id`,
+    tag: 'Batches',
+    query: emptyQuerySchema,
+    body: null,
+    response: httpBatchSchema,
+    successStatus: 200,
+  },
+  {
+    id: 'cancelBatch',
+    method: 'POST',
+    path: `${apiPaths.batches}/:id/cancel`,
+    tag: 'Batches',
+    query: emptyQuerySchema,
+    body: null,
+    response: httpBatchSchema,
+    successStatus: 200,
+  },
+  {
+    id: 'watchRun',
+    method: 'GET',
+    path: `${apiPaths.runs}/:id/events`,
     tag: 'Runs',
     query: emptyQuerySchema,
     body: null,
-    response: httpRunSchema,
+    response: null,
     successStatus: 200,
   },
   {

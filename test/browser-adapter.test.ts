@@ -15,7 +15,24 @@ test('registry loads browser adapter capabilities from its package specifier', a
   const capabilities = registry.listCapabilities();
   assert.deepEqual(
     capabilities.map(({ key }) => key),
-    ['browser.goto', 'browser.click', 'browser.fill', 'browser.expect_text', 'browser.screenshot'],
+    [
+      'browser.watch_requests',
+      'browser.expect_requests',
+      'browser.goto',
+      'browser.click',
+      'browser.fill',
+      'browser.expect_text',
+      'browser.screenshot',
+      'browser.canvas_probe',
+      'browser.expect',
+      'browser.expect_url',
+      'browser.reload',
+      'browser.mouse',
+      'browser.touch_drag',
+      'browser.route',
+      'browser.unroute',
+      'browser.release',
+    ],
   );
 });
 
@@ -36,6 +53,9 @@ test('HTTP catalog exposes browser capabilities', async () => {
     const keys = new Set(page.items.flatMap((adapter) => adapter.capabilities.map(({ key }) => key)));
     assert.ok(keys.has('browser.goto'));
     assert.ok(keys.has('browser.expect_text'));
+    assert.ok(keys.has('browser.expect'));
+    assert.ok(keys.has('browser.route'));
+    assert.ok(keys.has('browser.release'));
   } finally {
     await close(server);
     await rm(dir, { force: true, recursive: true });

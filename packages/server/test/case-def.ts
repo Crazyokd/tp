@@ -1,5 +1,12 @@
 import type { CatalogCapability, RuntimeLeaf } from '@tp/contract/adapter';
-import { isTreeDocument, type CaseDefinition, type LeafNode, type NodeStatusResult, type TreeNode } from '@tp/contract';
+import {
+  isTreeDocument,
+  sessionsForLeaves,
+  type CaseDefinition,
+  type LeafNode,
+  type NodeStatusResult,
+  type TreeNode,
+} from '@tp/contract';
 
 export function leaf(type: 'Action' | 'Condition', capability: string, extra: Partial<LeafNode> = {}): LeafNode {
   return {
@@ -13,8 +20,8 @@ export function leaf(type: 'Action' | 'Condition', capability: string, extra: Pa
 }
 
 export function caseDef(definition: TreeNode | CaseDefinition): CaseDefinition {
-  if (isTreeDocument(definition)) return definition;
-  return { main: 'Main', trees: { Main: definition } };
+  const document = isTreeDocument(definition) ? definition : { main: 'Main', trees: { Main: definition } };
+  return { ...document, sessions: document.sessions ?? sessionsForLeaves(document.trees) };
 }
 
 export async function testLeafAdapter(node: RuntimeLeaf): Promise<NodeStatusResult> {

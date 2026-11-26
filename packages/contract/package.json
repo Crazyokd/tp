@@ -9,7 +9,10 @@
     "openapi": "node --import tsx src/openapi-cli.ts"
   },
   "exports": {
-    ".": "./src/index.ts",
+    ".": {
+      "browser": "./src/browser.ts",
+      "default": "./src/index.ts"
+    },
     "./adapter": "./src/adapter.ts",
     "./http": "./src/http.ts",
     "./json-schema": "./src/json-schema.ts"

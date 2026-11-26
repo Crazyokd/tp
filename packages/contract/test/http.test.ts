@@ -4,7 +4,17 @@ import { apiErrorSchema, httpStatusForCode } from '../src/http-error.ts';
 import { pageQuerySchema, paginate, pageSchema } from '../src/http-page.ts';
 import { z } from 'zod';
 import { httpMetricsSchema, operations } from '../src/http-operations.ts';
-import { apiPaths, adapterPath, casePath, runPath, runCancelPath, runArtifactPath, workerPath } from '../src/http.ts';
+import {
+  apiPaths,
+  adapterPath,
+  casePath,
+  groupPath,
+  runPath,
+  runEventsPath,
+  runCancelPath,
+  runArtifactPath,
+  workerPath,
+} from '../src/http.ts';
 
 test('error code maps to status', () => {
   assert.equal(httpStatusForCode('not_found'), 404);
@@ -36,19 +46,35 @@ test('paginate slices after the caller filtered', () => {
 test('public paths', () => {
   assert.equal(apiPaths.adapters, '/api/adapters');
   assert.equal(apiPaths.cases, '/api/cases');
+  assert.equal(apiPaths.groups, '/api/groups');
+  assert.equal(groupPath('a'), '/api/groups/a');
   assert.equal(apiPaths.runs, '/api/runs');
   assert.equal(apiPaths.workers, '/api/workers');
   assert.equal(apiPaths.metrics, '/api/metrics');
   assert.equal(adapterPath('demo'), '/api/adapters/demo');
   assert.equal(casePath('a'), '/api/cases/a');
   assert.equal(runPath('a'), '/api/runs/a');
+  assert.equal(runEventsPath('a'), '/api/runs/a/events');
   assert.equal(runCancelPath('a'), '/api/runs/a/cancel');
+  assert.ok(operations.some((item) => item.id === 'watchRun' && item.path === '/api/runs/:id/events'));
+  assert.equal(
+    operations.some((item) => item.id === 'getRun'),
+    false,
+  );
   assert.equal(runArtifactPath('r1', 'a1'), '/api/runs/r1/artifacts/a1');
   assert.ok(
     operations.some((item) => item.id === 'getRunArtifact' && item.path === '/api/runs/:id/artifacts/:artifactId'),
   );
   assert.equal(workerPath('1'), '/api/workers/1');
-  assert.deepEqual(Object.keys(apiPaths).sort(), ['adapters', 'cases', 'metrics', 'runs', 'workers']);
+  assert.deepEqual(Object.keys(apiPaths).sort(), [
+    'adapters',
+    'batches',
+    'cases',
+    'groups',
+    'metrics',
+    'runs',
+    'workers',
+  ]);
 });
 
 test('metrics DTO is collect snapshot wrapped in instruments', () => {

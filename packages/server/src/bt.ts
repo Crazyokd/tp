@@ -20,12 +20,20 @@ import { applyLeafOutput, assembleLeafInput, InvalidLeafOutputError, MissingLeaf
 const leafTypes = new Set<string>(leafNodeTypes);
 const UNKNOWN_EXECUTION_ERROR = 'Unknown execution error';
 
+// RUNNING 主循环两次 tick 之间的最小间隔：没有它，快速叶子（毫秒级命令调用）会把循环
+// 打成忙轮，progress 事件的全树克隆以每秒数千次的速率分配，直接碾压 GC 直至 worker OOM。
+export const DEFAULT_TREE_TICK_INTERVAL_MS = 25;
+
 function leafFailureError(output: JsonObject | undefined): string | undefined {
   const error = output?.error;
   return typeof error === 'string' && error.trim() !== '' ? error : undefined;
 }
 
-type Adapter = (node: RuntimeLeaf, context: LeafTickContext) => Promise<NodeStatusResult>;
+type Adapter = (
+  node: RuntimeLeaf,
+  context: LeafTickContext,
+  lookup: (key: string) => unknown,
+) => Promise<NodeStatusResult>;
 type HaltLeaf = (node: RuntimeLeaf) => Promise<void>;
 type ExecuteOptions = {
   adapter: Adapter;
@@ -35,6 +43,8 @@ type ExecuteOptions = {
   capabilities?: readonly CatalogCapability[];
   signal?: AbortSignal;
   nextRevision?: () => number;
+  tickIntervalMs?: number;
+  initialBlackboard?: Record<string, unknown>;
 };
 type OnProgress = (event: RunNodeProgressEvent) => void | Promise<void>;
 type Now = () => number;
@@ -556,6 +566,11 @@ class TimeoutNode extends BaseNode {
   }
 
   protected async tickBody(): Promise<NodeStatus> {
+    if (this.timedOut) {
+      await this.child.halt();
+      this.clearTimer();
+      return 'FAILURE';
+    }
     const status = await this.child.tick();
     if (status !== 'RUNNING') {
       this.clearTimer();
@@ -564,13 +579,8 @@ class TimeoutNode extends BaseNode {
     const msec = (this.ast as Extract<TreeNode, { type: 'Timeout' }>).msec;
     if (!this.timer) {
       this.timer = setTimeout(() => {
-        this.timedOut = true;
+        if (this.child.status() === 'RUNNING') this.timedOut = true;
       }, msec);
-    }
-    if (this.timedOut) {
-      await this.child.halt();
-      this.clearTimer();
-      return 'FAILURE';
     }
     return 'RUNNING';
   }
@@ -781,7 +791,9 @@ class LeafBtNode extends BaseNode {
         }
         throw error;
       }
-      const promise = this.runtime.adapter(runtimeLeaf(node, this.path), { input });
+      const promise = this.runtime.adapter(runtimeLeaf(node, this.path), { input }, (key) =>
+        this.runtime.board.peek(key),
+      );
       void promise.catch(() => undefined);
       work = { promise };
       this.runtime.leafWork.set(this.path, work);
@@ -975,6 +987,9 @@ export async function executeTree(rawDefinition: unknown, options: ExecuteOption
     options.nextRevision,
   );
   const board = createRunBlackboard();
+  for (const [key, value] of Object.entries(options.initialBlackboard ?? {})) {
+    board.write(key, value);
+  }
   const capabilities = new Map(
     (options.capabilities ?? []).map((capability) => [`${capability.adapter}::${capability.key}`, capability]),
   );
@@ -991,10 +1006,11 @@ export async function executeTree(rawDefinition: unknown, options: ExecuteOption
   if (!rootAst) throw new Error(`definition.main ${document.main} is not in trees`);
   const root = instantiate(rootAst, '', runtime, document.trees, [document.main]);
 
+  const tickIntervalMs = options.tickIntervalMs ?? DEFAULT_TREE_TICK_INTERVAL_MS;
   try {
     let status = await root.tick();
     while (status === 'RUNNING' && !options.signal?.aborted) {
-      await yieldTick();
+      await yieldTick(tickIntervalMs, options.signal);
       status = await root.tick();
     }
     if (options.signal?.aborted) {
@@ -1029,8 +1045,23 @@ function runtimeLeaf(node: LeafNode, path: string): RuntimeLeaf {
   return { ...node, path };
 }
 
-function yieldTick(): Promise<void> {
-  return new Promise((resolve) => setImmediate(resolve));
+function yieldTick(intervalMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(done, Math.max(0, intervalMs));
+    const onAbort = () => {
+      clearTimeout(timer);
+      done();
+    };
+    function done(): void {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 async function isSettled(promise: Promise<unknown>): Promise<boolean> {

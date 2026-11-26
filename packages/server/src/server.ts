@@ -23,19 +23,36 @@ import { createPlatform } from './platform.ts';
 import { createRunQueue } from './run-queue.ts';
 import { logger } from './log.ts';
 import { createServerMetrics, recordHttp, type ServerMetrics } from './metrics.ts';
+import { createRunWatchHub, parseLastEventId, toSseRun, type RunWatchHub } from './sse.ts';
 import { createWorkerPool, type WorkerPool } from './worker-pool.ts';
+import { DEFAULT_SESSION_CLEANUP_TIMEOUT_MS } from './session-cleanup.ts';
+import { DEFAULT_TREE_TICK_INTERVAL_MS } from './bt.ts';
 
 const HOST_ROOT = process.env.TP_HOST_ROOT ?? fileURLToPath(new URL('../../..', import.meta.url));
 const DEFAULT_PUBLIC_DIR = process.env.TP_PUBLIC_DIR ?? join(HOST_ROOT, 'dist', 'public');
 const log = logger('server');
 const httpLog = logger('http');
-const MUTATING_OPERATIONS = new Set(['createCase', 'updateCase', 'deleteCase', 'createRun', 'cancelRun']);
+const MUTATING_OPERATIONS = new Set([
+  'createCase',
+  'updateCase',
+  'deleteCase',
+  'createGroup',
+  'updateGroup',
+  'deleteGroup',
+  'createBatch',
+  'importBatch',
+  'cancelBatch',
+  'cancelRun',
+]);
 
 type ServerOptions = {
   dataFile?: string;
   publicDir?: string;
   workerThreads?: number;
+  sessionCleanupTimeoutMs?: number;
+  treeTickIntervalMs?: number;
   runQueueCapacity?: number;
+  runRetentionDays?: number;
   workspaceRoot?: string;
   adapterModules?: readonly string[];
   onWorkerFatal?: (error: Error) => void;
@@ -44,6 +61,10 @@ type ServerOptions = {
 type Platform = Awaited<ReturnType<typeof createPlatform>>;
 
 export async function createHttpServer(options: ServerOptions = {}): Promise<http.Server> {
+  const runRetentionDays = options.runRetentionDays ?? Number(process.env.TP_RUN_RETENTION_DAYS ?? 7);
+  if (!Number.isInteger(runRetentionDays) || runRetentionDays < 1) {
+    throw new Error('run retention days must be a positive integer');
+  }
   const metrics = createServerMetrics();
   const registry = createAdapterRegistry();
   await loadAdapterModules(registry, resolveAdapterModules(options), metrics);
@@ -52,21 +73,42 @@ export async function createHttpServer(options: ServerOptions = {}): Promise<htt
     metrics,
   });
   const workspaceRoot = options.workspaceRoot ?? join(HOST_ROOT, 'data', 'runs');
-  const platform = createPlatform(options.dataFile, { registry, runQueue, metrics, workspaceRoot });
+  const platform = await createPlatform(options.dataFile, { registry, runQueue, metrics, workspaceRoot });
+  let retentionCleanup = Promise.resolve();
+  const pruneBatches = () => {
+    retentionCleanup = platform.pruneBatches(Date.now() - runRetentionDays * 24 * 60 * 60 * 1000).then((count) => {
+      if (count > 0) log.info('pruned expired batches', count);
+    });
+    return retentionCleanup;
+  };
+  await pruneBatches();
   const publicDir = options.publicDir ?? DEFAULT_PUBLIC_DIR;
+  const watches = createRunWatchHub();
+  const originalApplyArtifact = runQueue.applyArtifact.bind(runQueue);
+  runQueue.applyArtifact = (id, event) => {
+    const next = originalApplyArtifact(id, event);
+    watches.publish(next);
+    return next;
+  };
   const pool = createWorkerPool({
     size: options.workerThreads ?? Number(process.env.TP_WORKER_THREADS ?? 1),
+    sessionCleanupTimeoutMs:
+      options.sessionCleanupTimeoutMs ??
+      Number(process.env.TP_SESSION_CLEANUP_TIMEOUT_MS ?? DEFAULT_SESSION_CLEANUP_TIMEOUT_MS),
+    treeTickIntervalMs:
+      options.treeTickIntervalMs ?? Number(process.env.TP_TREE_TICK_INTERVAL_MS ?? DEFAULT_TREE_TICK_INTERVAL_MS),
     registry,
     runQueue,
     workspaceRoot,
     onProgress: (runId, event) => {
-      runQueue.applyProgress(runId, event);
+      runQueue.recordProgress(runId, event);
+      if (watches.hasSubscribers(runId)) watches.publish(runQueue.get(runId));
     },
     onResult: async (runId, result) => {
-      await (await platform).finishRun(runId, result);
+      watches.publish(await (await platform).finishRun(runId, result));
     },
     onRunFatal: async (runId, result) => {
-      await (await platform).finishRun(runId, result);
+      watches.publish(await (await platform).finishRun(runId, result));
     },
     onFatal:
       options.onWorkerFatal ??
@@ -77,12 +119,18 @@ export async function createHttpServer(options: ServerOptions = {}): Promise<htt
     metrics,
   });
   pool.start();
+  const retentionTimer = setInterval(
+    () => {
+      void pruneBatches().catch((error: unknown) => log.error('run retention cleanup failed', error));
+    },
+    60 * 60 * 1000,
+  ).unref();
 
   const server = http.createServer(async (req, res) => {
     const started = performance.now();
     try {
       if (req.url?.startsWith('/api/')) {
-        await handleApi(await platform, registry, pool, metrics, started, req, res);
+        await handleApi(await platform, registry, pool, metrics, watches, started, req, res);
         return;
       }
       if (serveDocs(req, res)) return;
@@ -99,11 +147,16 @@ export async function createHttpServer(options: ServerOptions = {}): Promise<htt
   });
   const closeHttp = server.close.bind(server);
   server.close = ((callback?: (error?: Error) => void) => {
+    clearInterval(retentionTimer);
+    server.closeAllConnections();
     closeHttp((error) => {
-      void pool.close().then(
-        () => callback?.(error),
-        (poolError: unknown) => callback?.(poolError instanceof Error ? poolError : new Error(String(poolError))),
-      );
+      void pool
+        .close()
+        .then(() => retentionCleanup)
+        .then(
+          () => callback?.(error),
+          (poolError: unknown) => callback?.(poolError instanceof Error ? poolError : new Error(String(poolError))),
+        );
     });
     return server;
   }) as http.Server['close'];
@@ -115,6 +168,7 @@ async function handleApi(
   registry: AdapterRegistry,
   pool: WorkerPool,
   metrics: ServerMetrics,
+  watches: RunWatchHub,
   started: number,
   req: IncomingMessage,
   res: ServerResponse,
@@ -122,6 +176,21 @@ async function handleApi(
   const url = new URL(req.url ?? '/', 'http://localhost');
   const op = matchOperation(req.method ?? '', url.pathname);
   if (!op) throw new HttpError('not_found', 'not found');
+  if (op.id === 'watchRun') {
+    let lastEventId: number | undefined;
+    try {
+      lastEventId = parseLastEventId(req.headers['last-event-id']);
+    } catch {
+      throw new HttpError('invalid', 'Last-Event-ID must be a non-negative integer');
+    }
+    const run = await platform.getRun(op.params.id ?? '');
+    const snapshot = toSseRun(run);
+    if (!snapshot) throw new HttpError('invalid', `run ${op.params.id} is not a public Run`);
+    logHttpSuccess(req, op.id, op.successStatus);
+    recordHttp(metrics, op.id, op.successStatus, started);
+    watches.subscribe(snapshot, req, res, lastEventId);
+    return;
+  }
   const query = parseQuery(op.id, op.query, url.searchParams);
   const body = op.body ? op.body.parse(await readJson(req)) : null;
   const result = await dispatch(op.id, {
@@ -132,6 +201,7 @@ async function handleApi(
     registry,
     pool,
     metrics,
+    watches,
   });
   if (op.id === 'getRunArtifact') {
     const payload = result as { bytes: Buffer; name: string; mediaType: string };
@@ -167,9 +237,10 @@ async function dispatch(
     registry: AdapterRegistry;
     pool: WorkerPool;
     metrics: ServerMetrics;
+    watches: RunWatchHub;
   },
 ): Promise<unknown> {
-  const { params, query, body, platform, registry, pool, metrics } = context;
+  const { params, query, body, platform, registry, pool, metrics, watches } = context;
   const page = query as PageQuery;
   switch (id) {
     case 'listAdapters':
@@ -186,18 +257,38 @@ async function dispatch(
       return platform.updateCase(params.id ?? '', body);
     case 'deleteCase':
       return platform.deleteCase(params.id ?? '');
-    case 'listRuns': {
-      const { status, ...pageQuery } = query as PageQuery & { status?: RunStatus[] };
-      return paginate(await platform.listRuns({ status }), pageQuery);
+    case 'listGroups':
+      return paginate(await platform.listGroups(), page);
+    case 'getGroup':
+      return platform.getGroup(params.id ?? '');
+    case 'createGroup':
+      return platform.createGroup(body);
+    case 'updateGroup':
+      return platform.updateGroup(params.id ?? '', body);
+    case 'deleteGroup':
+      return platform.deleteGroup(params.id ?? '');
+    case 'listRuns':
+      return platform.listRuns(query as PageQuery & { status?: RunStatus[] });
+    case 'listBatches':
+      return platform.listBatches(page);
+    case 'getBatch':
+      return platform.getBatch(params.id ?? '');
+    case 'createBatch':
+      return platform.createBatch(body);
+    case 'importBatch':
+      return platform.importBatch(body);
+    case 'cancelBatch': {
+      return platform.cancelBatch(params.id ?? '', (run) => {
+        const snapshot = toSseRun(run);
+        if (snapshot) watches.publish(snapshot);
+        if (run.status === 'canceling') pool.cancel(run.id);
+      });
     }
-    case 'createRun':
-      return platform.createRun(body);
-    case 'getRun':
-      return platform.getRun(params.id ?? '');
     case 'getRunArtifact':
       return platform.getRunArtifact(params.id ?? '', params.artifactId ?? '');
     case 'cancelRun': {
       const run = await platform.cancelRun(params.id ?? '');
+      watches.publish(run);
       if (run.status === 'canceling') pool.cancel(run.id);
       return run;
     }
@@ -247,6 +338,7 @@ function toHttpAdapter(manifest: AdapterManifest) {
       ports: capability.ports,
       adapter: manifest.id,
     })),
+    session: manifest.session ?? { ports: [] },
   };
 }
 
